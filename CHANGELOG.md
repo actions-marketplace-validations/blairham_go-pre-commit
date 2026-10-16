@@ -6,12 +6,77 @@ whose section is missing.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Version numbers track upstream parity rather than semver of this codebase:
-`v4.6.x` targets feature parity with Python pre-commit 4.6. Sections up to and
+`v4.7.x` targets feature parity with Python pre-commit 4.7 (`v4.6.x` targeted 4.6). Sections up to and
 including 4.6.16 were reconstructed from the GitHub release notes when this
 file was introduced; the full notes are on the
 [releases page](https://github.com/blairham/go-pre-commit/releases).
 
 ## [Unreleased]
+
+### Fixed
+
+- Hooks receive their files in upstream's order. Upstream shuffles each
+  hook's file list with a fixed-seed `random.Random` before splitting it into
+  xargs batches, unless the hook is `require_serial`; this port never
+  shuffled, so order-sensitive hooks saw a different sequence. A
+  byte-compatible port of CPython's MT19937 seeding, `getrandbits` and
+  `shuffle` now reproduces it, skipping `require_serial`, `fail` and `pygrep`
+  hooks as upstream does. (#120)
+- Every command upstream runs inside a repository (`autoupdate`, `hook-impl`,
+  `install`, `install-hooks`, `migrate-config`, `run`, `try-repo`,
+  `uninstall`) now changes to the repository root first and rewrites
+  `--config` relative to it, as upstream's `_adjust_args_and_chdir` does;
+  `run` and `try-repo` do the same for `--files` and
+  `--commit-msg-filename`, and `try-repo` for a local repository path. Run
+  from a subdirectory, these commands now find the root's config instead of
+  failing to load it, and a printed config path is root-relative
+  (`-c ../alt.yaml` reports `alt.yaml`). Outside a repository, or inside
+  `.git`, they fail with upstream's `An error has occurred: FatalError: ...`
+  and a log in the store. (#109)
+- `language: julia` is ported from upstream 4.7.0. Hooks now run their
+  script: the entry's first word was dropped, so julia saw the hook's own
+  arguments as options and failed. The script resolves against the hook repo
+  for a remote hook and is left as written for `repo: local`. The env sets
+  `JULIA_LOAD_PATH` and unsets `JULIA_PROJECT`, as upstream's does. Install
+  copies the hook's `(Julia)Project.toml` and `(Julia)Manifest.toml` (or starts
+  from an empty `Project.toml`) and instantiates it with upstream's script,
+  where it used to `Pkg.develop` the hook repo and fail on any repo without a
+  project file. The environment directory is upstream's `juliaenv-<version>`;
+  a julia hook installed by an earlier release is reinstalled once, and its
+  old `julia_env-*` directory stays in the cache until the repo is gc'd. CI now
+  installs and runs a real julia hook, remote and local, against Python
+  pre-commit. (#118)
+
+- The first install of a remote hook repo no longer prints git's own output.
+  The store clones the way upstream's `Store.clone` does: `git init`, then a
+  shallow fetch of exactly the pinned `rev` (so a commit sha is fetched at
+  depth 1 instead of failing `git clone --branch` and falling back to a full
+  clone), submodules at depth 1, and a fetch of all tags only when that
+  fails. git's output is captured and shown only in the error when a clone
+  fails, as upstream's `CalledProcessError` reports it, and
+  `[INFO] Initializing environment for <repo>.` is printed as upstream prints
+  it. A parity row compares the first-install output byte for byte. (#117)
+
+- `language: node`'s default version follows upstream: `system` only when
+  `node` and `npm` are both real installs on `PATH` (not in a version
+  manager's `shims` directory, and not under the home directory unless that
+  is `/`), otherwise `default`, which nodeenv installs with no `-n`, i.e. its
+  own prebuilt node. Every non-Windows install used to symlink the host's
+  node, so on a machine whose node and npm are asdf shims the hook install
+  failed with `EALLOWGIT` where Python pre-commit passes. Ports upstream's
+  `lang_base.exe_exists`. (#119)
+
+## [4.7.0] - 2026-10-15
+
+### Changed
+
+- The parity target moves to Python pre-commit 4.7.0: the differential suite
+  pins and measures against it, and `v4.7.x` means parity with upstream 4.7.
+  4.7.0's one change (node hooks install without the host's `GIT_*`
+  variables) shipped in 4.6.17 with #102; its `git commit -a` parity row now
+  grades both sides instead of only this one. (#107)
+
+## [4.6.17] - 2026-10-15
 
 ### Changed
 
@@ -25,6 +90,30 @@ file was introduced; the full notes are on the
 
 ### Fixed
 
+- `autoupdate --repo` with a repo the config does not name prints
+  `repos (...) were not found in <config>` and exits 1 before updating
+  anything, as upstream 4.6.1 does, instead of silently ignoring it. (#105)
+- `run --all-files` passes a file with an unresolved merge conflict to hooks
+  once rather than once per index stage, via `git ls-files --deduplicate`
+  (upstream 4.6.1, pre-commit/pre-commit#3727). This needs git 2.31 or
+  later. (#106)
+- The pre-push hook now decides what to check the way upstream's
+  `_pre_push_ns` does. Pushing a new branch checks the commits being pushed
+  rather than the staged files; deleting a branch runs no hooks; a remote tip
+  that was never fetched falls back to checking the commits the remote lacks
+  instead of failing the push; a push that includes the root commit runs on
+  all files; and with several refs on stdin the first one with something to
+  check wins. A legacy pre-push hook still sees git's ref lines. (#103)
+- `julia`: hooks install and run with `JULIA_DEPOT_PATH` inside the hook
+  env, as upstream 4.6.1 does, so packages and precompile caches no longer
+  land in the shared depot. (#104)
+- `language: node` hooks install the way upstream 4.7.0 does:
+  `npm install --allow-git=root --install-links -g git+file://<repo>` plus
+  `additional_dependencies`, replacing the local install → `npm pack` →
+  global install sequence that npm 12 breaks, and fixing hooks with a
+  `scripts.build` under npm 11. npm runs without the host's repository-pinning
+  `GIT_*` variables, so a hook installed during `git commit -a` or inside a
+  submodule works, and the env's own npm is used ahead of the host's. (#102)
 - Releases no longer pass `target_commitish`, which made creating a release
   fail with a 403 when its range touched `.github/workflows`. (#95)
 
@@ -192,7 +281,9 @@ file was introduced; the full notes are on the
 - First release of the rewrite: Python parity for `run` and `uninstall`, the
   `/v4` module path, and a GoReleaser release workflow.
 
-[Unreleased]: https://github.com/blairham/go-pre-commit/compare/v4.6.16...HEAD
+[Unreleased]: https://github.com/blairham/go-pre-commit/compare/v4.7.0...HEAD
+[4.7.0]: https://github.com/blairham/go-pre-commit/compare/v4.6.17...v4.7.0
+[4.6.17]: https://github.com/blairham/go-pre-commit/compare/v4.6.16...v4.6.17
 [4.6.16]: https://github.com/blairham/go-pre-commit/compare/v4.6.15...v4.6.16
 [4.6.15]: https://github.com/blairham/go-pre-commit/compare/v4.6.14...v4.6.15
 [4.6.14]: https://github.com/blairham/go-pre-commit/compare/v4.6.13...v4.6.14

@@ -6,6 +6,7 @@ package git
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,7 +37,8 @@ func NoGitEnv() []string {
 	var env []string
 	for _, e := range os.Environ() {
 		k, _, _ := strings.Cut(e, "=")
-		if strings.HasPrefix(k, "GIT_") && !allowed[k] && !strings.HasPrefix(k, "GIT_CONFIG_KEY_") && !strings.HasPrefix(k, "GIT_CONFIG_VALUE_") {
+		if strings.HasPrefix(k, "GIT_") && !allowed[k] && !strings.HasPrefix(k, "GIT_CONFIG_KEY_") &&
+			!strings.HasPrefix(k, "GIT_CONFIG_VALUE_") {
 			continue
 		}
 		env = append(env, e)
@@ -170,6 +172,56 @@ func GetRoot() (string, error) {
 	return CmdOutput("rev-parse", "--show-toplevel")
 }
 
+// FatalError is a failure upstream raises as its FatalError, worded as it
+// words it. Those messages end in punctuation, which errors.New strings
+// conventionally do not.
+type FatalError string
+
+func (e FatalError) Error() string { return string(e) }
+
+// The two failures upstream's git.get_root reports.
+const (
+	ErrNoRepository FatalError = "git failed. Is it installed, and are you in a Git repository directory?"
+	ErrInsideGitDir FatalError = "git toplevel unexpectedly empty! make sure you are not " +
+		"inside the `.git` directory of your repository."
+)
+
+// Toplevel ports upstream's git.get_root, which pre-commit's main uses to
+// find the directory it changes into before running any command that needs
+// a repository. It is relative to cwd, the physical working directory, and
+// deliberately not `--show-toplevel`: upstream notes that on Windows that
+// form exposes the volume behind a drive mapped with SUBST, and asks for
+// `--show-cdup` instead, which also means it must reject being run from
+// inside the .git directory, where the answer is empty.
+//
+// It runs git with the caller's environment as upstream's cmd_output does,
+// not NoGitEnv: a GIT_DIR or GIT_WORK_TREE the user exported is meant to
+// decide which repository this is.
+func Toplevel(cwd string) (string, error) {
+	run := func(args ...string) (string, error) {
+		var stdout bytes.Buffer
+		cmd := exec.Command("git", args...)
+		cmd.Dir = cwd
+		cmd.Stdout = &stdout
+		if err := cmd.Run(); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(stdout.String()), nil
+	}
+	cdup, err := run("rev-parse", "--show-cdup")
+	if err != nil {
+		return "", ErrNoRepository
+	}
+	insideGitDir, err := run("rev-parse", "--is-inside-git-dir")
+	if err != nil {
+		return "", ErrNoRepository
+	}
+	if insideGitDir != "false" {
+		return "", ErrInsideGitDir
+	}
+	return filepath.Join(cwd, cdup), nil
+}
+
 // GetRootInDir returns the root directory of a git repository from a given directory.
 func GetRootInDir(dir string) (string, error) {
 	return CmdOutputInDir(dir, "rev-parse", "--show-toplevel")
@@ -223,8 +275,11 @@ func GetStagedFiles() ([]string, error) {
 }
 
 // GetAllFiles returns all tracked files in the repository.
+//
+// --deduplicate (git >= 2.31) lists a path once even when an unresolved merge
+// conflict leaves it in the index at several stages, as upstream 4.6.1 does.
 func GetAllFiles() ([]string, error) {
-	out, err := hostOutput("", "ls-files", "-z")
+	out, err := hostOutput("", "ls-files", "-z", "--deduplicate")
 	if err != nil {
 		return nil, err
 	}
@@ -278,9 +333,116 @@ func Clone(url, dest string, args ...string) error {
 	return cmd.Run()
 }
 
-// ShallowClone clones a repository with depth 1.
-func ShallowClone(url, dest, ref string) error {
-	return Clone(url, dest, "--depth", "1", "--branch", ref, "--single-branch", "-c", "protocol.version=2")
+// NoFSMonitor is upstream's git.NO_FS_MONITOR: config that keeps git's
+// builtin fsmonitor daemon from being started for a throwaway repository.
+var NoFSMonitor = []string{"-c", "core.useBuiltinFSMonitor=false"}
+
+// CalledProcessError is a failed command whose output was captured rather
+// than shown, the way upstream's util.CalledProcessError carries it. Its
+// message is upstream's byte for byte, so git's own explanation of a failure
+// reaches the user only in the error.
+type CalledProcessError struct {
+	Cmd        []string
+	Stdout     []byte
+	Stderr     []byte
+	ReturnCode int
+}
+
+func (e *CalledProcessError) Error() string {
+	indentOrNone := func(part []byte) string {
+		if len(part) == 0 {
+			return " (none)"
+		}
+		return strings.TrimRight("\n    "+strings.ReplaceAll(string(part), "\n", "\n    "), " \t\r\n\v\f")
+	}
+	quoted := make([]string, len(e.Cmd))
+	for i, a := range e.Cmd {
+		quoted[i] = pyRepr(a)
+	}
+	cmd := "(" + strings.Join(quoted, ", ")
+	if len(quoted) == 1 {
+		cmd += ","
+	}
+	cmd += ")"
+	return fmt.Sprintf("command: %s\nreturn code: %d\nstdout:%s\nstderr:%s",
+		cmd, e.ReturnCode, indentOrNone(e.Stdout), indentOrNone(e.Stderr))
+}
+
+// pyRepr renders s the way Python's repr renders a str, which is how
+// upstream prints each argument of a failed command.
+func pyRepr(s string) string {
+	quote := byte('\'')
+	if strings.Contains(s, "'") && !strings.Contains(s, "\"") {
+		quote = '"'
+	}
+	var b strings.Builder
+	b.WriteByte(quote)
+	for _, r := range s {
+		switch {
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == rune(quote):
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte(quote)
+	return b.String()
+}
+
+// RunCaptured runs git in dir under NoGitEnv with its output captured, as
+// upstream's cmd_output_b does. A non-zero exit is a *CalledProcessError
+// holding what git printed; on success the output is discarded.
+func RunCaptured(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = NoGitEnv()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	// Upstream reports the resolved executable, not the bare name.
+	return &CalledProcessError{
+		Cmd:        append([]string{cmd.Path}, args...),
+		ReturnCode: exitErr.ExitCode(),
+		Stdout:     stdout.Bytes(),
+		Stderr:     stderr.Bytes(),
+	}
+}
+
+// InitRepo ports upstream's git.init_repo: an empty repository at path, with
+// no template (so the user's template hooks cannot recurse into it), whose
+// origin is remote. A remote that is a local directory is made absolute, since
+// the commands that follow run from inside path.
+func InitRepo(path, remote string) error {
+	if info, err := os.Stat(remote); err == nil && info.IsDir() {
+		if abs, err := filepath.Abs(remote); err == nil {
+			remote = abs
+		}
+	}
+	initArgs := append(append([]string{}, NoFSMonitor...), "init", "--template=", path)
+	if err := RunCaptured("", initArgs...); err != nil {
+		return err
+	}
+	remoteArgs := append(append([]string{}, NoFSMonitor...), "remote", "add", "origin", remote)
+	return RunCaptured(path, remoteArgs...)
 }
 
 // Fetch runs git fetch in a directory.

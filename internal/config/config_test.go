@@ -355,7 +355,10 @@ func TestApplyDefaults_DefaultLanguageVersion(t *testing.T) {
 		t.Errorf("expected python3.9, got %s", cfg.Repos[0].Hooks[0].LanguageVersion)
 	}
 	if cfg.Repos[0].Hooks[1].LanguageVersion != "16.0.0" {
-		t.Errorf("hook with explicit language_version should not be overwritten, got %s", cfg.Repos[0].Hooks[1].LanguageVersion)
+		t.Errorf(
+			"hook with explicit language_version should not be overwritten, got %s",
+			cfg.Repos[0].Hooks[1].LanguageVersion,
+		)
 	}
 	if cfg.Repos[0].Hooks[2].LanguageVersion != "" {
 		t.Errorf("hook with no matching default should remain empty, got %s", cfg.Repos[0].Hooks[2].LanguageVersion)
@@ -467,11 +470,11 @@ func TestCheckMinimumVersion(t *testing.T) {
 		{name: "lower requirement", minVersion: "0.0.1", want: true},
 		{name: "higher requirement", minVersion: "99.0.0", want: false},
 		{name: "higher minor", minVersion: "4.99.0", want: false},
-		{name: "lower minor", minVersion: "4.5.999", want: true},
-		{name: "higher patch", minVersion: "4.6.999", want: false},
-		{name: "fewer parts in requirement", minVersion: "4.6", want: true},
-		{name: "more parts all zero", minVersion: "4.6.0.0", want: false},
-		{name: "more parts higher", minVersion: "4.6.0.1", want: false},
+		{name: "lower minor", minVersion: "4.6.999", want: true},
+		{name: "higher patch", minVersion: "4.7.999", want: false},
+		{name: "fewer parts in requirement", minVersion: "4.7", want: true},
+		{name: "more parts all zero", minVersion: "4.7.0.0", want: false},
+		{name: "more parts higher", minVersion: "4.7.0.1", want: false},
 		{name: "zero requirement", minVersion: "0.0.0", want: true},
 	}
 	for _, tc := range tests {

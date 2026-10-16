@@ -43,6 +43,12 @@ type Hook struct {
 	RepoDir string // Local clone directory.
 }
 
+// IsLocal reports whether the hook comes from a `repo: local` block —
+// upstream's `hook.src == 'local'`.
+func (h *Hook) IsLocal() bool {
+	return h.Repo == "local"
+}
+
 // InstallKey returns a unique key for deduplication of hook environments.
 func (h *Hook) InstallKey() string {
 	deps := strings.Join(h.AdditionalDependencies, ",")
@@ -84,7 +90,12 @@ func (h *Hook) MatchesStage(stage config.Stage) bool {
 }
 
 // MergeManifest creates a Hook by merging config overrides onto a manifest hook.
-func MergeManifest(manifest *config.ManifestHook, hookCfg *config.HookConfig, repoCfg *config.RepoConfig, globalCfg *config.Config) *Hook {
+func MergeManifest(
+	manifest *config.ManifestHook,
+	hookCfg *config.HookConfig,
+	repoCfg *config.RepoConfig,
+	globalCfg *config.Config,
+) *Hook {
 	h := &Hook{
 		ID:                      manifest.ID,
 		Name:                    manifest.Name,

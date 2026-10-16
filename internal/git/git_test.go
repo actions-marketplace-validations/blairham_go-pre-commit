@@ -4,6 +4,7 @@
 package git
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -407,6 +408,51 @@ func TestGetAllFiles(t *testing.T) {
 	}
 }
 
+// TestGetAllFiles_MergeConflictListedOnce mirrors upstream 4.6.1
+// (pre-commit/pre-commit#3727): during an unresolved merge conflict the index
+// holds a conflicted path at stages 1, 2 and 3, and a plain `git ls-files`
+// prints it once per stage. run --all-files must pass it to hooks once.
+func TestGetAllFiles_MergeConflictListedOnce(t *testing.T) {
+	dir := initTestRepo(t)
+
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil && args[0] != "merge" {
+			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	write := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "conflict.txt"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("base\n")
+	git("add", "conflict.txt")
+	git("commit", "-m", "base")
+	git("checkout", "-b", "other")
+	write("other\n")
+	git("commit", "-am", "other")
+	git("checkout", "-")
+	write("ours\n")
+	git("commit", "-am", "ours")
+	git("merge", "--no-ff", "other") // expected to fail with a conflict
+
+	t.Chdir(dir)
+
+	files, err := GetAllFiles()
+	if err != nil {
+		t.Fatalf("GetAllFiles failed: %v", err)
+	}
+	want := []string{"README.md", "conflict.txt"}
+	if strings.Join(files, ",") != strings.Join(want, ",") {
+		t.Errorf("expected %v, got %v", want, files)
+	}
+}
+
 // --- GetStagedFiles tests ---
 
 func TestGetStagedFiles_None(t *testing.T) {
@@ -724,5 +770,72 @@ func TestHeadRev(t *testing.T) {
 	}
 	if got != strings.TrimSpace(string(want)) {
 		t.Errorf("HeadRev = %q, want %q", got, strings.TrimSpace(string(want)))
+	}
+}
+
+// The message is upstream's CalledProcessError.__bytes__, byte for byte.
+func TestCalledProcessErrorMatchesUpstream(t *testing.T) {
+	e := &CalledProcessError{
+		Cmd:        []string{"/usr/bin/git", "checkout", "it's"},
+		ReturnCode: 1,
+		Stderr:     []byte("error: one\nerror: two\n\n"),
+	}
+	want := "command: ('/usr/bin/git', 'checkout', \"it's\")\n" +
+		"return code: 1\n" +
+		"stdout: (none)\n" +
+		"stderr:\n    error: one\n    error: two"
+	if got := e.Error(); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestPyRepr(t *testing.T) {
+	for in, want := range map[string]string{
+		"plain":   `'plain'`,
+		"it's":    `"it's"`,
+		`a'b"c`:   `'a\'b"c'`,
+		`back\sl`: `'back\\sl'`,
+		"nl\n":    `'nl\n'`,
+		"\x01":    `'\x01'`,
+	} {
+		if got := pyRepr(in); got != want {
+			t.Errorf("pyRepr(%q) = %s, want %s", in, got, want)
+		}
+	}
+}
+
+// RunCaptured keeps git's output out of the terminal and hands it back in a
+// *CalledProcessError on failure.
+func TestRunCapturedReturnsOutputOnFailure(t *testing.T) {
+	err := RunCaptured(t.TempDir(), "rev-parse", "--verify", "no-such-ref")
+	var cpe *CalledProcessError
+	if !errors.As(err, &cpe) {
+		t.Fatalf("got %T %v, want *CalledProcessError", err, err)
+	}
+	if cpe.ReturnCode == 0 || len(cpe.Stderr) == 0 {
+		t.Errorf("want a non-zero code and git's stderr, got %d %q", cpe.ReturnCode, cpe.Stderr)
+	}
+	if !filepath.IsAbs(cpe.Cmd[0]) {
+		t.Errorf("command should name the resolved git, got %q", cpe.Cmd[0])
+	}
+}
+
+// InitRepo makes an empty repository whose origin is the absolute path of a
+// local remote, without the user's template.
+func TestInitRepo(t *testing.T) {
+	remote := t.TempDir()
+	dest := filepath.Join(t.TempDir(), "clone")
+	if err := InitRepo(dest, remote); err != nil {
+		t.Fatal(err)
+	}
+	out, err := CmdOutputInDir(dest, "remote", "get-url", "origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != remote {
+		t.Errorf("origin = %q, want %q", out, remote)
+	}
+	if _, err := os.Stat(filepath.Join(dest, ".git", "hooks")); !os.IsNotExist(err) {
+		t.Errorf("--template= should leave no hooks directory, stat err = %v", err)
 	}
 }

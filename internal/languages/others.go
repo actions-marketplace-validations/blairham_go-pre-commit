@@ -181,61 +181,6 @@ var rLang = &SimpleLanguage{
 	},
 }
 
-// Julia implements the Language interface for Julia hooks.
-// Julia is kept as a standalone struct because its Run method uses RunCommand
-// directly with a --project= flag instead of the standard RunHookCommand pattern.
-type Julia struct{}
-
-func (j *Julia) Name() string              { return "julia" }
-func (j *Julia) EnvironmentDir() string    { return "julia_env" }
-func (j *Julia) GetDefaultVersion() string { return "default" }
-
-func (j *Julia) HealthCheck(prefix, version string) error {
-	cmd := exec.Command("julia", "--version")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("julia not available: %w", err)
-	}
-	return nil
-}
-
-func (j *Julia) InstallEnvironment(prefix, version string, additionalDeps []string) error {
-	envDir := filepath.Join(prefix, j.EnvironmentDir()+"-"+version)
-
-	installScript := `
-using Pkg
-Pkg.activate("` + envDir + `")
-Pkg.develop(path="` + prefix + `")
-Pkg.instantiate()
-`
-	for _, dep := range additionalDeps {
-		installScript += `Pkg.add("` + dep + `")` + "\n"
-	}
-
-	cmd := exec.Command("julia", "--startup-file=no", "-e", installScript)
-	cmd.Dir = prefix
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("julia install failed: %s: %w", string(out), err)
-	}
-
-	return nil
-}
-
-func (j *Julia) Run(ctx context.Context, prefix, workDir, entry string, args, fileArgs []string, version string) (int, []byte, error) {
-	envDir := filepath.Join(prefix, j.EnvironmentDir()+"-"+version)
-
-	parts := ParseEntry(entry)
-	if len(parts) == 0 {
-		return -1, nil, fmt.Errorf("empty entry")
-	}
-
-	allArgs := []string{"--startup-file=no", "--project=" + envDir}
-	allArgs = append(allArgs, parts[1:]...)
-	allArgs = append(allArgs, args...)
-	allArgs = append(allArgs, fileArgs...)
-
-	return RunCommand(ctx, workDir, "julia", allArgs...)
-}
-
 // Swift implements the Language interface for Swift hooks.
 // Swift is kept as a standalone struct because its install involves a multi-step
 // build + copy workflow that doesn't fit the SimpleLanguage pattern.
@@ -274,7 +219,13 @@ func (s *Swift) InstallEnvironment(prefix, version string, additionalDeps []stri
 	return nil
 }
 
-func (s *Swift) Run(ctx context.Context, prefix, workDir, entry string, args, fileArgs []string, version string) (int, []byte, error) {
+// Run implements Language.
+func (s *Swift) Run(
+	ctx context.Context,
+	prefix, workDir, entry string,
+	args, fileArgs []string,
+	version string,
+) (int, []byte, error) {
 	envDir := filepath.Join(prefix, s.EnvironmentDir()+"-"+version)
 	binDir := filepath.Join(envDir, "bin")
 	env := []string{PrependPath(binDir)}

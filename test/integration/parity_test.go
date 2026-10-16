@@ -220,10 +220,10 @@ func printParityReport() int {
 // ---------------------------------------------------------------------------
 
 // parityTarget is the Python pre-commit minor line this project claims parity
-// with, and it is the meaning of our own version number: v4.6.x means "behaves
-// like Python pre-commit 4.6.x". Comparing against any other line measures
+// with, and it is the meaning of our own version number: v4.7.x means "behaves
+// like Python pre-commit 4.7.x". Comparing against any other line measures
 // something we are not claiming, so resolvePython refuses to do it.
-const parityTarget = "4.6"
+const parityTarget = "4.7"
 
 // pythonInfo describes the counterpart binary a parity run measured against.
 // It goes into the JSON report because a parity percentage without the version
@@ -673,9 +673,13 @@ func TestNoArgumentsRuns(t *testing.T) {
 	goOut, goExit := runCmd(t, goRepo, goBinary)
 	addExitResult("(no arguments)", "runs the hooks, which fail", pyExit, goExit, pyExit != 0 && pyExit == goExit, "")
 	compareHookStatuses(t, "(no arguments)", pyOut, goOut, 3)
-	addFSResult("(no arguments)", "the staged file was fixed",
-		readFile(filepath.Join(pyRepo, "test.txt")) == "trailing\n" && readFile(filepath.Join(goRepo, "test.txt")) == "trailing\n",
-		fmt.Sprintf("py=%q go=%q", readFile(filepath.Join(pyRepo, "test.txt")), readFile(filepath.Join(goRepo, "test.txt"))))
+	addFSResult(
+		"(no arguments)",
+		"the staged file was fixed",
+		readFile(filepath.Join(pyRepo, "test.txt")) == "trailing\n" &&
+			readFile(filepath.Join(goRepo, "test.txt")) == "trailing\n",
+		fmt.Sprintf("py=%q go=%q", readFile(filepath.Join(pyRepo, "test.txt")), readFile(filepath.Join(goRepo, "test.txt"))),
+	)
 }
 
 func TestHelp(t *testing.T) {
@@ -1231,12 +1235,16 @@ func TestReadmeEverydayFlow(t *testing.T) {
 		_, pyExit := runCmd(t, pyRepo, pyBin, "run", "trailing-whitespace", "--color=never")
 		_, goExit := runCmd(t, goRepo, goBinary, "run", "trailing-whitespace", "--color=never")
 		addExitResult("run", "staged-only run fails on the staged file", pyExit, goExit, pyExit != 0 && goExit != 0, "")
-		addFSResult("run", "staged file fixed, unstaged file untouched",
+		addFSResult(
+			"run",
+			"staged file fixed, unstaged file untouched",
 			readFile(filepath.Join(pyRepo, "test.txt")) == "staged\n" && readFile(filepath.Join(goRepo, "test.txt")) == "staged\n" &&
-				readFile(filepath.Join(pyRepo, "old.txt")) == "old   \n" && readFile(filepath.Join(goRepo, "old.txt")) == "old   \n",
+				readFile(filepath.Join(pyRepo, "old.txt")) == "old   \n" &&
+				readFile(filepath.Join(goRepo, "old.txt")) == "old   \n",
 			fmt.Sprintf("py test=%q old=%q, go test=%q old=%q",
 				readFile(filepath.Join(pyRepo, "test.txt")), readFile(filepath.Join(pyRepo, "old.txt")),
-				readFile(filepath.Join(goRepo, "test.txt")), readFile(filepath.Join(goRepo, "old.txt"))))
+				readFile(filepath.Join(goRepo, "test.txt")), readFile(filepath.Join(goRepo, "old.txt"))),
+		)
 	})
 
 	t.Run("commit runs the installed hook", func(t *testing.T) {
@@ -1253,9 +1261,13 @@ func TestReadmeEverydayFlow(t *testing.T) {
 		goOut, goExit := runCmd(t, goRepo, "git", "-c", "commit.gpgsign=false", "commit", "-m", "x")
 		addExitResult("install", "commit is stopped by the hook", pyExit, goExit, pyExit != 0 && goExit != 0, "")
 		compareHookStatuses(t, "install", pyOut, goOut, 3)
-		addFSResult("install", "hook fixed the file during the commit",
-			readFile(filepath.Join(pyRepo, "test.txt")) == "commit me\n" && readFile(filepath.Join(goRepo, "test.txt")) == "commit me\n",
-			fmt.Sprintf("py=%q go=%q", readFile(filepath.Join(pyRepo, "test.txt")), readFile(filepath.Join(goRepo, "test.txt"))))
+		addFSResult(
+			"install",
+			"hook fixed the file during the commit",
+			readFile(filepath.Join(pyRepo, "test.txt")) == "commit me\n" &&
+				readFile(filepath.Join(goRepo, "test.txt")) == "commit me\n",
+			fmt.Sprintf("py=%q go=%q", readFile(filepath.Join(pyRepo, "test.txt")), readFile(filepath.Join(goRepo, "test.txt"))),
+		)
 		// The grading needs to have run the binary under test.
 		got, _ := runCmd(t, goRepo, "sh", "-c", "command -v pre-commit")
 		addOutputResult("install", "hook resolved the binary under test",
@@ -1438,6 +1450,30 @@ func TestAutoupdate(t *testing.T) {
 			pyRev == goRev,
 			fmt.Sprintf("py=%s go=%s", pyRev, goRev))
 	})
+
+	// Upstream 4.6.1: a --repo the config does not name fails before
+	// anything is updated, listing the missing repos sorted (#105).
+	t.Run("mistyped --repo alongside a valid one", func(t *testing.T) {
+		pyRepo := initTestRepo(t, standardCfg, "test\n")
+		goRepo := initTestRepo(t, standardCfg, "test\n")
+		args := []string{
+			"autoupdate", "--color=never",
+			"--repo", "https://github.com/pre-commit/pre-commit-hookz",
+			"--repo", "https://github.com/pre-commit/pre-commit-hooks",
+		}
+
+		pyOut, pyErr, pyExit := runSplit(t, pyRepo, pyBin, args...)
+		goOut, goErr, goExit := runSplit(t, goRepo, goBinary, args...)
+		addExitResult("autoupdate", "mistyped --repo exits 1", pyExit, goExit,
+			pyExit == goExit && goExit == 1, "")
+		addOutputResult("autoupdate", "mistyped --repo output",
+			pyOut == goOut && pyErr == goErr,
+			fmt.Sprintf("py=%q/%q go=%q/%q", pyOut, pyErr, goOut, goErr))
+
+		goCfg := readFile(filepath.Join(goRepo, ".pre-commit-config.yaml"))
+		addFSResult("autoupdate", "mistyped --repo leaves config alone",
+			goCfg == standardCfg, "")
+	})
 }
 
 func extractRev(cfg string) string {
@@ -1478,7 +1514,7 @@ func TestTryRepo(t *testing.T) {
 		full = append(full, "--all-files", "--color=never")
 		pyOut, pyExit = runCmd(t, pyRepo, pyBin, full...)
 		goOut, goExit = runCmd(t, goRepo, goBinary, full...)
-		return
+		return pyOut, goOut, pyExit, goExit
 	}
 
 	t.Run("remote repo, named hook, valid input", func(t *testing.T) {
@@ -1587,5 +1623,312 @@ func TestInstallHooks(t *testing.T) {
 		_, pyExit := runCmd(t, pyRepo, pyBin, "install-hooks")
 		_, goExit := runCmd(t, goRepo, goBinary, "install-hooks")
 		addExitResult("install-hooks", "exits 0", pyExit, goExit, pyExit == goExit, "")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Tests: language: node installs (#102)
+// ---------------------------------------------------------------------------
+
+// nodeHookRepo builds a git repo holding a node hook that fails on any file
+// containing BAD, and returns its path and HEAD. scripts, when set, is the
+// package.json "scripts" object: upstream 4.6.2 (#3743) fixed hooks with a
+// scripts.build under npm 11, which the git+file install shape is what fixes.
+func nodeHookRepo(t *testing.T, scripts string) (dir, rev string) {
+	t.Helper()
+	dir = t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "commit.gpgsign", "false"}} {
+		runCmd(t, dir, "git", args...)
+	}
+	pkg := `{"name": "no-bad", "version": "1.0.0", "bin": {"no-bad": "bin.js"}`
+	if scripts != "" {
+		pkg += `, "scripts": ` + scripts
+	}
+	pkg += "}\n"
+	files := map[string]string{
+		"package.json": pkg,
+		"bin.js": "#!/usr/bin/env node\n" +
+			"const fs = require('fs');\n" +
+			"let bad = 0;\n" +
+			"for (const f of process.argv.slice(2)) {\n" +
+			"  if (fs.readFileSync(f, 'utf8').includes('BAD')) { console.log(f); bad = 1; }\n" +
+			"}\n" +
+			"process.exit(bad);\n",
+		".pre-commit-hooks.yaml": "-   id: no-bad\n    name: no BAD\n    entry: no-bad\n    language: node\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runCmd(t, dir, "git", "add", "-A")
+	if out, code := runCmd(t, dir, "git", "commit", "-qm", "hook"); code != 0 {
+		t.Fatalf("committing the hook repo failed:\n%s", out)
+	}
+	out, _ := runCmd(t, dir, "git", "rev-parse", "HEAD")
+	return dir, strings.TrimSpace(out)
+}
+
+func nodeHookConfig(dir, rev string) string {
+	return fmt.Sprintf("repos:\n-   repo: %s\n    rev: %s\n    hooks:\n    -   id: no-bad\n", dir, rev)
+}
+
+func TestNodeHooks(t *testing.T) {
+	pyBin := pythonPreCommit(t)
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("npm is not installed")
+	}
+
+	// Each tool gets its own cache, so neither reuses the other's install.
+	runBoth := func(t *testing.T, cfg, content string) (pyOut, goOut string, pyExit, goExit int) {
+		t.Helper()
+		pyRepo := initTestRepo(t, cfg, content)
+		goRepo := initTestRepo(t, cfg, content)
+		t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+		pyOut, pyExit = runCmd(t, pyRepo, pyBin, "run", "--all-files", "--color=never")
+		t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+		goOut, goExit = runCmd(t, goRepo, goBinary, "run", "--all-files", "--color=never")
+		return pyOut, goOut, pyExit, goExit
+	}
+
+	for _, tc := range []struct{ name, scripts string }{
+		{"hook repo installs from git", ""},
+		{"hook repo with scripts.build", `{"build": "node -e \"\""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, rev := nodeHookRepo(t, tc.scripts)
+			cfg := nodeHookConfig(dir, rev)
+
+			pyOut, goOut, pyExit, goExit := runBoth(t, cfg, "BAD\n")
+			addExitResult("run", "node: "+tc.name+", rejects bad input", pyExit, goExit,
+				pyExit != 0 && goExit != 0, fmt.Sprintf("py:\n%s\ngo:\n%s", pyOut, goOut))
+			compareHookStatuses(t, "run", pyOut, goOut, 1)
+
+			pyOut, goOut, pyExit, goExit = runBoth(t, cfg, "fine\n")
+			addExitResult("run", "node: "+tc.name+", passes good input", pyExit, goExit,
+				pyExit == 0 && goExit == 0, fmt.Sprintf("py:\n%s\ngo:\n%s", pyOut, goOut))
+		})
+	}
+
+	// Upstream 4.7.0 (#3774) installs under no_git_env so `git commit -a`,
+	// whose GIT_INDEX_FILE points at the host's index.lock, does not leak into
+	// the clone npm makes of git+file://. 4.6.x failed here with "unable to
+	// read <sha>"; from the 4.7 target on, both sides must install and pass.
+	// hook-impl also scrubs GIT_INDEX_FILE process-wide, so this row stays
+	// green without the NoGitEnv in the node backend;
+	// TestNodeInstallEnvironmentRunsNpmWithoutGitEnv is what pins that.
+	t.Run("hook installed during git commit -a", func(t *testing.T) {
+		dir, rev := nodeHookRepo(t, "")
+		cfg := nodeHookConfig(dir, rev)
+		hostPath := os.Getenv("PATH")
+		commitA := func(bin string) (string, int) {
+			// This binary's installed hook script execs `pre-commit` from PATH;
+			// Python's execs its own interpreter.
+			t.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+hostPath)
+			repo := initTestRepo(t, cfg, "fine\n")
+			for _, args := range [][]string{{"config", "commit.gpgsign", "false"}, {"commit", "-qm", "init", "--no-verify"}} {
+				if out, code := runCmd(t, repo, "git", args...); code != 0 {
+					t.Fatalf("git %v failed:\n%s", args, out)
+				}
+			}
+			t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+			if out, code := runCmd(t, repo, bin, "install"); code != 0 {
+				t.Fatalf("%s install failed:\n%s", bin, out)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "test.txt"), []byte("still fine\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return runCmd(t, repo, "git", "commit", "-a", "-m", "edit")
+		}
+		pyOut, pyExit := commitA(pyBin)
+		goOut, goExit := commitA(goBinary)
+		addExitResult(
+			"run",
+			"node: hook installs during git commit -a",
+			pyExit,
+			goExit,
+			pyExit == 0 && goExit == 0 &&
+				strings.Contains(pyOut, "no BAD") &&
+				strings.Contains(goOut, "no BAD"),
+			fmt.Sprintf("py:\n%s\ngo:\n%s", pyOut, goOut),
+		)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Tests: first install of a remote repo (#117)
+// ---------------------------------------------------------------------------
+
+// The first run against a remote repo clones it into the store. Upstream
+// captures every git command it runs for that, so the whole of what a user
+// sees is the "[INFO] Initializing environment" line and the hook results.
+// This compares that output byte for byte, which is what the exit-code rows
+// cannot see: git's clone chatter and its "fatal: Remote branch <sha> not
+// found" from a shallow clone that cannot take a sha both exit 0.
+func TestRemoteRepoFirstInstall(t *testing.T) {
+	pyBin := pythonPreCommit(t)
+
+	dir := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "commit.gpgsign", "false"}} {
+		runCmd(t, dir, "git", args...)
+	}
+	manifest := "-   id: no-bad\n    name: no BAD\n    entry: BAD\n    language: pygrep\n"
+	if err := os.WriteFile(filepath.Join(dir, ".pre-commit-hooks.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, dir, "git", "add", "-A")
+	if out, code := runCmd(t, dir, "git", "commit", "-qm", "hook"); code != 0 {
+		t.Fatalf("committing the hook repo failed:\n%s", out)
+	}
+	// A second commit, so the sha pinned below is not the branch tip a full
+	// clone would land on by default.
+	sha, _ := runCmd(t, dir, "git", "rev-parse", "HEAD")
+	sha = strings.TrimSpace(sha)
+	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, dir, "git", "add", "-A")
+	if out, code := runCmd(t, dir, "git", "commit", "-qm", "more"); code != 0 {
+		t.Fatalf("committing the hook repo failed:\n%s", out)
+	}
+
+	cfg := fmt.Sprintf("repos:\n-   repo: %s\n    rev: %s\n    hooks:\n    -   id: no-bad\n", dir, sha)
+	for _, tc := range []struct {
+		name, content string
+		exit          int
+	}{
+		{"sha rev", "fine\n", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pyRepo := initTestRepo(t, cfg, tc.content)
+			goRepo := initTestRepo(t, cfg, tc.content)
+			t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+			pyOut, pyExit := runCmd(t, pyRepo, pyBin, "run", "--all-files", "--color=never")
+			t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+			goOut, goExit := runCmd(t, goRepo, goBinary, "run", "--all-files", "--color=never")
+
+			addExitResult("run", "first install: "+tc.name, pyExit, goExit,
+				pyExit == tc.exit && goExit == tc.exit, fmt.Sprintf("py:\n%s\ngo:\n%s", pyOut, goOut))
+			// The repos differ only by their temp dir, which no line names.
+			addOutputResult("run", "first install output: "+tc.name, pyOut == goOut,
+				fmt.Sprintf("py:\n%s\ngo:\n%s", pyOut, goOut))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: language: julia (#118)
+// ---------------------------------------------------------------------------
+
+// juliaHookScript prints its arguments and fails on any file containing BAD.
+const juliaHookScript = `println("args: ", join(ARGS, " "))
+bad = filter(f -> !startswith(f, "--") && occursin("BAD", read(f, String)), ARGS)
+foreach(f -> println("bad file: ", f), bad)
+exit(isempty(bad) ? 0 : 1)
+`
+
+func TestJuliaHooks(t *testing.T) {
+	pyBin := pythonPreCommit(t)
+	if _, err := exec.LookPath("julia"); err != nil {
+		if os.Getenv("PARITY_REQUIRE") != "" {
+			t.Fatal("PARITY_REQUIRE is set but julia is not installed")
+		}
+		t.Skip("julia is not installed")
+	}
+
+	// Each tool gets its own cache, so neither reuses the other's install.
+	// JULIA_PROJECT is set to prove both unset it (upstream's get_env_patch).
+	t.Setenv("JULIA_PROJECT", "/nonexistent")
+	runBoth := func(t *testing.T, cfg string, files map[string]string) (pyOut, goOut string, pyExit, goExit int) {
+		t.Helper()
+		var repos [2]string
+		for i := range repos {
+			repos[i] = initTestRepo(t, cfg, "fine\n")
+			for name, content := range files {
+				path := filepath.Join(repos[i], name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runCmd(t, repos[i], "git", "add", "-A")
+		}
+		t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+		pyOut, pyExit = runCmd(t, repos[0], pyBin, "run", "--all-files", "--color=never")
+		t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+		goOut, goExit = runCmd(t, repos[1], goBinary, "run", "--all-files", "--color=never")
+		return pyOut, goOut, pyExit, goExit
+	}
+	check := func(t *testing.T, name, cfg string, files map[string]string, wantArgs string) {
+		t.Helper()
+		files["bad.txt"] = "BAD\n"
+		pyOut, goOut, pyExit, goExit := runBoth(t, cfg, files)
+		detail := fmt.Sprintf("py:\n%s\ngo:\n%s", pyOut, goOut)
+		addExitResult("run", "julia: "+name+", rejects bad input", pyExit, goExit,
+			pyExit != 0 && goExit != 0 &&
+				strings.Contains(pyOut, wantArgs) && strings.Contains(goOut, wantArgs) &&
+				strings.Contains(goOut, "bad file: bad.txt"),
+			detail)
+		compareHookStatuses(t, "run", pyOut, goOut, 1)
+		argsLine := func(out string) string {
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "args: ") {
+					return line
+				}
+			}
+			return ""
+		}
+		addOutputResult("run", "julia: "+name+", script sees the same argv", argsLine(pyOut) == argsLine(goOut),
+			fmt.Sprintf("py=%q go=%q", argsLine(pyOut), argsLine(goOut)))
+
+		delete(files, "bad.txt")
+		pyOut, goOut, pyExit, goExit = runBoth(t, cfg, files)
+		addExitResult("run", "julia: "+name+", passes good input", pyExit, goExit,
+			pyExit == 0 && goExit == 0, fmt.Sprintf("py:\n%s\ngo:\n%s", pyOut, goOut))
+	}
+
+	// A remote hook's script is relative to the hook repo, and its
+	// Project.toml is copied into the environment.
+	t.Run("remote hook", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "commit.gpgsign", "false"}} {
+			runCmd(t, dir, "git", args...)
+		}
+		files := map[string]string{
+			"bin/hook.jl":      juliaHookScript,
+			"Project.toml":     "name = \"JuliaHook\"\nuuid = \"5b1d6a3e-2f8c-4c1a-9d0e-7a3b2c1d0e9f\"\nversion = \"0.1.0\"\n",
+			"src/JuliaHook.jl": "module JuliaHook\nend\n",
+			".pre-commit-hooks.yaml": "-   id: no-bad-jl\n    name: no BAD (julia)\n    entry: bin/hook.jl --tag=remote\n" +
+				"    language: julia\n    files: \\.txt$\n",
+		}
+		for name, content := range files {
+			path := filepath.Join(dir, name)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		runCmd(t, dir, "git", "add", "-A")
+		if out, code := runCmd(t, dir, "git", "commit", "-qm", "hook"); code != 0 {
+			t.Fatalf("committing the hook repo failed:\n%s", out)
+		}
+		rev, _ := runCmd(t, dir, "git", "rev-parse", "HEAD")
+		cfg := fmt.Sprintf(
+			"repos:\n-   repo: %s\n    rev: %s\n    hooks:\n    -   id: no-bad-jl\n",
+			dir,
+			strings.TrimSpace(rev),
+		)
+		check(t, "remote hook", cfg, map[string]string{}, "args: --tag=remote ")
+	})
+
+	// A local hook's script is left as written, relative to the working tree.
+	t.Run("local hook", func(t *testing.T) {
+		cfg := "repos:\n-   repo: local\n    hooks:\n    -   id: no-bad-jl\n        name: no BAD (julia)\n" +
+			"        entry: tools/hook.jl --tag=local\n        language: julia\n        files: \\.txt$\n"
+		check(t, "local hook", cfg, map[string]string{"tools/hook.jl": juliaHookScript}, "args: --tag=local ")
 	})
 }

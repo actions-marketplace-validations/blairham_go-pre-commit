@@ -10,15 +10,58 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
+	"sync"
+
+	"github.com/blairham/go-pre-commit/v4/internal/git"
 )
 
 // Node implements the Language interface for Node.js hooks.
 type Node struct{}
 
-func (n *Node) Name() string              { return "node" }
-func (n *Node) EnvironmentDir() string    { return "node_env" }
-func (n *Node) GetDefaultVersion() string { return "default" }
+// Name is the language's name in a hook manifest.
+func (n *Node) Name() string { return "node" }
+
+// EnvironmentDir is upstream's ENVIRONMENT_DIR.
+func (n *Node) EnvironmentDir() string { return "node_env" }
+
+// GetDefaultVersion is upstream node.get_default_version (4.7.0), cached for
+// the process as upstream's lru_cache does.
+func (n *Node) GetDefaultVersion() string { return nodeDefaultVersionOnce() }
+
+var nodeDefaultVersionOnce = sync.OnceValue(func() string {
+	return nodeDefaultVersion(runtime.GOOS)
+})
+
+// nodeDefaultVersion is "system" when the host's node and npm are real
+// installs (exeExists: on PATH, not a version manager's shim, not inside the
+// home directory), so nodeenv symlinks them instead of downloading a node.
+// Otherwise, and always on Windows where nodeenv cannot do `-n system`, it is
+// "default": nodeenv's own prebuilt node. A shimmed node is a trampoline into
+// whatever version the manager resolves, and its npm is not one the hook was
+// installed against; upstream refuses to reuse it.
+func nodeDefaultVersion(goos string) string {
+	if goos == "windows" {
+		return "default"
+	}
+	if exeExists("node") && exeExists("npm") {
+		return "system"
+	}
+	return "default"
+}
+
+// nodeenvArgs is upstream's nodeenv command line: `default` resolves through
+// get_default_version, and only a version other than `default` is passed as
+// -n, so a `default` env gets nodeenv's own prebuilt node.
+func nodeenvArgs(envDir, version, defaultVersion string) []string {
+	if version == "default" {
+		version = defaultVersion
+	}
+	args := []string{"--prebuilt", "--clean-src", envDir}
+	if version != "default" {
+		args = append(args, "-n", version)
+	}
+	return args
+}
 
 func (n *Node) HealthCheck(prefix, version string) error {
 	envDir := filepath.Join(prefix, n.EnvironmentDir()+"-"+version)
@@ -56,74 +99,81 @@ func nodeEnvVarsFor(goos, envDir string) []string {
 }
 
 func (n *Node) InstallEnvironment(prefix, version string, additionalDeps []string) error {
+	pkgs, err := nodeInstallPackages(prefix, additionalDeps)
+	if err != nil {
+		return err
+	}
 	envDir := filepath.Join(prefix, n.EnvironmentDir()+"-"+version)
 
 	// Create the nodeenv ("system" symlinks the host node into the env).
-	// nodeenv cannot do `-n system` on Windows, so there, as upstream, the
-	// default is no -n at all: nodeenv's own default prebuilt node.
-	args := []string{"--prebuilt", "--clean-src", envDir}
-	switch {
-	case version != "default":
-		args = append(args, "-n", version)
-	case runtime.GOOS != "windows":
-		args = append(args, "-n", "system")
-	}
-	cmd := exec.Command("nodeenv", args...)
+	cmd := exec.Command("nodeenv", nodeenvArgs(envDir, version, nodeDefaultVersion(runtime.GOOS))...)
 	cmd.Dir = prefix
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nodeenv failed: %s: %w", string(out), err)
 	}
 
-	env := nodeEnvVars(envDir)
-
-	// A `repo: local` hook has no package to install — its prefix is a
-	// placeholder directory with no package.json — so there is nothing to pack
-	// and the additional_dependencies are the whole environment.
-	if _, err := os.Stat(filepath.Join(prefix, "package.json")); err != nil {
-		if len(additionalDeps) == 0 {
-			return fmt.Errorf("`language: node` must have package.json or additional_dependencies")
-		}
-		return npmInstallGlobal(prefix, env, additionalDeps)
-	}
-
-	// Install the hook repo's own dependencies locally, then pack it and
-	// install the package globally into the env alongside additional deps —
-	// the same local-install → pack → global-install dance as Python
-	// pre-commit, which is what creates the bin entry points in envDir/bin.
-	cmd = exec.Command("npm", "install")
-	cmd.Dir = prefix
-	cmd.Env = append(cmd.Environ(), env...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("npm install failed: %s: %w", string(out), err)
-	}
-
-	cmd = exec.Command("npm", "pack")
-	cmd.Dir = prefix
-	cmd.Env = append(cmd.Environ(), env...)
-	packOut, err := cmd.Output()
+	// As upstream 4.7.0: npm runs under the host environment with every
+	// GIT_* variable that pins a repository stripped, so a hook installed
+	// during `git commit -a` or from inside a submodule does not hand the
+	// host's GIT_INDEX_FILE / GIT_DIR to the git clone npm makes of the
+	// git+file:// package.
+	env := append(git.NoGitEnv(), nodeEnvVars(envDir)...)
+	// npm is resolved on the env's PATH, as upstream's in_env does, so the
+	// npm nodeenv installed with the env's node is the one that runs; the
+	// host's is only the fallback (a `-n system` env has no npm of its own).
+	npm, err := FindExecutable("npm", venvBinDir(envDir))
 	if err != nil {
-		return fmt.Errorf("npm pack failed: %s: %w", string(packOut), err)
+		return fmt.Errorf("npm not found: %w", err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(packOut)), "\n")
-	pkg := filepath.Join(prefix, strings.TrimSpace(lines[len(lines)-1]))
-	defer os.Remove(pkg)
-
-	return npmInstallGlobal(prefix, env, append([]string{pkg}, additionalDeps...))
+	return npmInstall(npm, prefix, env, pkgs)
 }
 
-// npmInstallGlobal installs packages into the hook environment, which npm
-// resolves from NPM_CONFIG_PREFIX in env.
-func npmInstallGlobal(prefix string, env, pkgs []string) error {
-	cmd := exec.Command("npm", append([]string{"install", "-g"}, pkgs...)...)
+// nodeInstallPackages mirrors upstream's install_environment (4.6.1+): a hook
+// repo with .git and package.json is installed straight from git via a
+// git+file:// spec, which is how npm runs its prepare/build scripts the way a
+// git dependency would; otherwise (a `repo: local` hook) the
+// additional_dependencies are the whole environment.
+func nodeInstallPackages(prefix string, additionalDeps []string) ([]string, error) {
+	var pkgs []string
+	if pathExists(filepath.Join(prefix, ".git")) && pathExists(filepath.Join(prefix, "package.json")) {
+		pkgs = append(pkgs, "git+file://"+prefix)
+	}
+	pkgs = append(pkgs, additionalDeps...)
+	if len(pkgs) == 0 {
+		return nil, fmt.Errorf("`language: node` must have package.json or additional_dependencies")
+	}
+	return pkgs, nil
+}
+
+func pathExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// nodeInstallArgs is upstream's install command, verbatim.
+func nodeInstallArgs(pkgs []string) []string {
+	return append([]string{"install", "--allow-git=root", "--install-links", "-g"}, pkgs...)
+}
+
+// npmInstall installs pkgs into the hook environment, which npm resolves from
+// NPM_CONFIG_PREFIX in env. env is the complete environment for npm.
+func npmInstall(npm, prefix string, env, pkgs []string) error {
+	cmd := exec.Command(npm, nodeInstallArgs(pkgs)...)
 	cmd.Dir = prefix
-	cmd.Env = append(cmd.Environ(), env...)
+	cmd.Env = env
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("npm install -g failed: %s: %w", string(out), err)
+		return fmt.Errorf("npm install failed: %s: %w", string(out), err)
 	}
 	return nil
 }
 
-func (n *Node) Run(ctx context.Context, prefix, workDir, entry string, args, fileArgs []string, version string) (int, []byte, error) {
+// Run implements Language.
+func (n *Node) Run(
+	ctx context.Context,
+	prefix, workDir, entry string,
+	args, fileArgs []string,
+	version string,
+) (int, []byte, error) {
 	envDir := filepath.Join(prefix, n.EnvironmentDir()+"-"+version)
 	env := nodeEnvVars(envDir)
 	return RunHookCommand(ctx, workDir, entry, args, fileArgs, env)

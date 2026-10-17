@@ -145,7 +145,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) RunResult {
 	}
 
 	if len(hooksToRun) == 0 && opts.HookID != "" {
-		output.Error("No hook with id %q found", opts.HookID)
+		// Upstream writes this with output.write_line: stdout, no [ERROR].
+		fmt.Printf("No hook with id `%s` in stage `%s`\n", opts.HookID, opts.HookStage)
 		result.Errors++
 		return result
 	}
@@ -407,9 +408,14 @@ func filterFiles(files []string, h *Hook) []string {
 	return matched
 }
 
-// runHookXargs runs a hook using xargs-style batching and concurrency.
-// All execution goes through lang.Run to ensure language-specific environment
-// setup (e.g. virtualenv PATH for Python hooks).
+// runHookXargs runs a hook the way upstream's lang_base.run_xargs and
+// xargs.xargs do: the files are partitioned into runs of at most
+// max(4, ceil(files/jobs)) arguments that also fit the platform's command
+// length, the partitions run on min(partitions, jobs) workers, and their
+// output is concatenated in partition order with the exit code of largest
+// magnitude. jobs is 1 for a require_serial hook. All execution goes through
+// lang.Run so language-specific environment setup (e.g. a virtualenv's PATH)
+// applies to every partition.
 func runHookXargs(
 	ctx context.Context,
 	lang languages.Language,
@@ -419,53 +425,53 @@ func runHookXargs(
 	jobs int,
 ) (int, []byte, error) {
 	ctx = languages.WithLocalHook(ctx, h.IsLocal())
-	if len(fileArgs) == 0 {
-		return lang.Run(ctx, h.RepoDir, workDir, h.Entry, h.Args, nil, h.LanguageVersion)
+	// fail never reaches xargs upstream, and pygrep runs in-process here, so
+	// a partition would only split output that upstream prints in one piece.
+	if len(fileArgs) == 0 || h.Language == "fail" || h.Language == "pygrep" {
+		return lang.Run(ctx, h.RepoDir, workDir, h.Entry, h.Args, fileArgs, h.LanguageVersion)
 	}
 
 	fileArgs = shuffledFileArgs(h.Language, h.RequireSerial, fileArgs)
 
-	// Determine batch size and concurrency.
-	maxJobs := 1
+	concurrency := 1
 	if !h.RequireSerial {
-		maxJobs = targetConcurrency(jobs, len(fileArgs))
+		concurrency = targetConcurrency(jobs)
 	}
 
-	// Batch the file arguments.
-	batches := batchFileArgs(fileArgs, xargs.DefaultMaxBatchSize())
+	cmd := hookCommand(h)
+	partitions, err := xargs.Partition(cmd, fileArgs, concurrency, xargs.MaxLength(cmd))
+	if err != nil {
+		return -1, nil, err
+	}
 
-	type batchResult struct {
-		exitCode int
-		output   []byte
+	type partitionResult struct {
 		err      error
+		output   []byte
+		exitCode int
+	}
+	results := make([]partitionResult, len(partitions))
+	run := func(i int) {
+		exitCode, out, err := lang.Run(ctx, h.RepoDir, workDir, h.Entry, h.Args, partitions[i], h.LanguageVersion)
+		results[i] = partitionResult{exitCode: exitCode, output: out, err: err}
 	}
 
-	results := make([]batchResult, len(batches))
-
-	if maxJobs <= 1 || len(batches) <= 1 {
-		// Sequential execution.
-		for i, batch := range batches {
-			exitCode, out, err := lang.Run(ctx, h.RepoDir, workDir, h.Entry, h.Args, batch, h.LanguageVersion)
-			results[i] = batchResult{exitCode: exitCode, output: out, err: err}
+	if threads := min(len(partitions), concurrency); threads <= 1 {
+		for i := range partitions {
+			run(i)
 		}
 	} else {
-		// Parallel execution.
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, maxJobs)
-		for i, batch := range batches {
-			wg.Add(1)
-			go func(idx int, files []string) {
-				defer wg.Done()
+		sem := make(chan struct{}, threads)
+		for i := range partitions {
+			wg.Go(func() {
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				exitCode, out, err := lang.Run(ctx, h.RepoDir, workDir, h.Entry, h.Args, files, h.LanguageVersion)
-				results[idx] = batchResult{exitCode: exitCode, output: out, err: err}
-			}(i, batch)
+				run(i)
+			})
 		}
 		wg.Wait()
 	}
 
-	// Aggregate results.
 	var allOutput []byte
 	exitCode := 0
 	for _, r := range results {
@@ -473,57 +479,46 @@ func runHookXargs(
 			return -1, allOutput, r.err
 		}
 		allOutput = append(allOutput, r.output...)
-		if r.exitCode != 0 {
+		if absInt(r.exitCode) > absInt(exitCode) {
 			exitCode = r.exitCode
 		}
 	}
-
 	return exitCode, allOutput, nil
 }
 
-// batchFileArgs splits file arguments into batches.
-func batchFileArgs(files []string, maxBatchSize int) [][]string {
-	if maxBatchSize <= 0 || len(files) <= maxBatchSize {
-		return [][]string{files}
+func absInt(n int) int {
+	if n < 0 {
+		return -n
 	}
-	var batches [][]string
-	for i := 0; i < len(files); i += maxBatchSize {
-		end := i + maxBatchSize
-		if end > len(files) {
-			end = len(files)
-		}
-		batches = append(batches, files[i:end])
-	}
-	return batches
+	return n
 }
 
-// targetConcurrency returns the target number of parallel jobs.
-// Matches Python pre-commit: min(cpu_count, max(1, fileCount/4)) when jobs is unset.
-// An explicit jobs value overrides the file-count cap.
-func targetConcurrency(jobs, fileCount int) int {
-	if os.Getenv("PRE_COMMIT_NO_CONCURRENCY") != "" {
+// hookCommand approximates the command upstream partitions a hook's files
+// against: the split entry plus args, with the executable resolved on PATH
+// as parse_shebang.normalize_cmd resolves it. Only its length matters, and
+// only when a partition nears the platform's command-length limit.
+func hookCommand(h *Hook) []string {
+	cmd := append(languages.ParseEntry(h.Entry), h.Args...)
+	if len(cmd) > 0 && !strings.ContainsAny(cmd[0], `/\`) {
+		if exe, err := exec.LookPath(cmd[0]); err == nil {
+			cmd[0] = exe
+		}
+	}
+	return cmd
+}
+
+// targetConcurrency is the number of partitions a non-serial hook targets.
+// It is upstream's lang_base.target_concurrency (PRE_COMMIT_NO_CONCURRENCY,
+// then TRAVIS, then the CPU count) unless --jobs gave an explicit count,
+// which PRE_COMMIT_NO_CONCURRENCY still overrides.
+func targetConcurrency(jobs int) int {
+	if _, ok := os.LookupEnv("PRE_COMMIT_NO_CONCURRENCY"); ok {
 		return 1
 	}
 	if jobs > 0 {
 		return jobs
 	}
-	n := runtime.NumCPU()
-	if os.Getenv("TRAVIS") != "" {
-		n = 2
-	}
-	if n < 1 {
-		n = 1
-	}
-	if fileCount > 0 {
-		capped := fileCount / 4
-		if capped < 1 {
-			capped = 1
-		}
-		if capped < n {
-			n = capped
-		}
-	}
-	return n
+	return xargs.TargetConcurrency()
 }
 
 // worktreeDiff returns the working tree's diff against the host index, the
@@ -589,7 +584,43 @@ type installTask struct {
 
 // InstallEnvironments installs environments for all provided hooks.
 // Installs are run in parallel since each operates on a separate directory.
-func InstallEnvironments(ctx context.Context, hooks []*Hook) error {
+//
+// lock, when non-nil, is the store's exclusive lock, taken around the
+// installs as upstream's install_hook_envs does. Without it two pre-commit
+// processes sharing a store (two commits in sibling worktrees) each install
+// into the same environment directory at once, and one's cleanup removes the
+// other's half-built module cache.
+func InstallEnvironments(_ context.Context, hooks []*Hook, lock func() (func(), error)) error {
+	tasks, err := environmentsToInstall(hooks)
+	if err != nil || len(tasks) == 0 {
+		return err
+	}
+	if lock != nil {
+		unlock, err := lock()
+		if err != nil {
+			return fmt.Errorf("failed to acquire store lock: %w", err)
+		}
+		defer unlock()
+		// Another process may have already completed this work.
+		if tasks, err = environmentsToInstall(hooks); err != nil || len(tasks) == 0 {
+			return err
+		}
+	}
+	for _, t := range tasks {
+		// Leftovers at the path (a stale install state, a partial install)
+		// are removed before installing, as upstream's _hook_install does.
+		envPath := languages.EnvPath(t.hook.RepoDir, t.lang, t.hook.LanguageVersion)
+		if err := fsutil.RemoveAll(envPath); err != nil {
+			return fmt.Errorf("failed to clear %s before installing: %w", envPath, err)
+		}
+	}
+	return installTasks(tasks)
+}
+
+// environmentsToInstall is upstream's _need_installed: one task per distinct
+// install key whose environment is not already installed with the same
+// dependencies.
+func environmentsToInstall(hooks []*Hook) ([]installTask, error) {
 	// Deduplicate and filter to only hooks that need installation.
 	seen := make(map[string]bool)
 	var tasks []installTask
@@ -603,7 +634,7 @@ func InstallEnvironments(ctx context.Context, hooks []*Hook) error {
 
 		lang, err := languages.Get(h.Language)
 		if err != nil {
-			return fmt.Errorf("unsupported language %q for hook %q: %w", h.Language, h.ID, err)
+			return nil, fmt.Errorf("unsupported language %q for hook %q: %w", h.Language, h.ID, err)
 		}
 
 		if lang.EnvironmentDir() == "" {
@@ -617,35 +648,28 @@ func InstallEnvironments(ctx context.Context, hooks []*Hook) error {
 
 		envPath := languages.EnvPath(envDir, lang, h.LanguageVersion)
 		stateFile := filepath.Join(envPath, installStateFile)
-		expectedState := h.InstallKey()
-
-		if data, err := os.ReadFile(stateFile); err == nil {
-			if string(data) == expectedState {
-				continue // Already installed with same deps.
-			}
-			// State mismatch — deps changed, need reinstall.
-			// A golang/cargo env is read-only; plain os.RemoveAll would leave it
-			// behind and the stale env would be reused despite the state mismatch.
-			_ = fsutil.RemoveAll(envPath)
-		} else if _, statErr := os.Stat(envPath); statErr == nil {
-			// Env dir exists but carries no valid state: a partial install, an
-			// interrupted run, or a CI cache restore that dropped the state
-			// file. Installing OVER such leftovers is not safe — golang's
-			// `go install ./...` runs in the hook repo with the env (and its
-			// module cache) nested inside it, so a pre-populated pkg/mod makes
-			// the pattern walk fail with "directory … outside main module".
-			// Python pre-commit removes an existing env before every install
-			// (repository.py _hook_install); mirror that for stateless leftovers.
-			_ = fsutil.RemoveAll(envPath)
+		// upstream's _hook_installed: the install state matches and the
+		// language's health_check finds the env still healthy.
+		if data, err := os.ReadFile(stateFile); err == nil && string(data) == h.InstallKey() &&
+			lang.HealthCheck(envDir, h.LanguageVersion) == nil {
+			continue // Already installed with same deps.
 		}
-
+		// A state mismatch (deps changed), or an env dir with no valid state
+		// (a partial install, an interrupted run, or a CI cache restore that
+		// dropped the state file): either way it is reinstalled, and the
+		// caller clears the directory first. Installing OVER such leftovers
+		// is not safe — golang's `go install ./...` runs in the hook repo with
+		// the env (and its module cache) nested inside it, so a pre-populated
+		// pkg/mod makes the pattern walk fail with "directory … outside main
+		// module"; and a golang/cargo env is read-only, so fsutil.RemoveAll is
+		// what clears it.
 		tasks = append(tasks, installTask{hook: h, lang: lang})
 	}
+	return tasks, nil
+}
 
-	if len(tasks) == 0 {
-		return nil
-	}
-
+// installTasks runs the installs and writes each one's install state.
+func installTasks(tasks []installTask) error {
 	// Run installs in parallel with bounded concurrency.
 	maxWorkers := runtime.NumCPU()
 	if maxWorkers > len(tasks) {
@@ -678,6 +702,15 @@ func InstallEnvironments(ctx context.Context, hooks []*Hook) error {
 			); err != nil {
 				_ = fsutil.RemoveAll(envPath)
 				errs[idx] = fmt.Errorf("failed to install environment for hook %q: %w", t.hook.ID, err)
+				return
+			}
+			// As upstream's _hook_install: a fresh env must be healthy.
+			if healthErr := t.lang.HealthCheck(t.hook.RepoDir, t.hook.LanguageVersion); healthErr != nil {
+				errs[idx] = errors.Join(fmt.Errorf(
+					"BUG: expected environment for %s to be healthy immediately after install, "+
+						"please open an issue describing your environment\n\nmore info:\n\n%v",
+					t.hook.Language, healthErr,
+				), fsutil.RemoveAll(envPath))
 				return
 			}
 

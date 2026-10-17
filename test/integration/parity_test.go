@@ -778,6 +778,90 @@ func TestValidateConfig(t *testing.T) {
 	})
 }
 
+// TestEmptyRepos: upstream's schema is cfgv.Required('repos', check_array),
+// so `repos: []` is a valid config with no hooks, while a missing `repos`
+// key fails (#131).
+func TestEmptyRepos(t *testing.T) {
+	pyBin := pythonPreCommit(t)
+
+	cmds := [][]string{
+		{"run", "--all-files"},
+		{"validate-config", ".pre-commit-config.yaml"},
+		{"install-hooks"},
+		{"autoupdate"},
+	}
+	for _, tc := range []struct {
+		name, cfg string
+		wantFail  bool
+	}{
+		{"repos: []", "repos: []\n", false},
+		{"missing repos", "fail_fast: true\n", true},
+	} {
+		for _, args := range cmds {
+			t.Run(tc.name+"/"+args[0], func(t *testing.T) {
+				pyRepo := initTestRepo(t, tc.cfg, "test\n")
+				goRepo := initTestRepo(t, tc.cfg, "test\n")
+				_, pyExit := runCmd(t, pyRepo, pyBin, args...)
+				_, goExit := runCmd(t, goRepo, goBinary, args...)
+				addExitResult(args[0], "config "+tc.name, pyExit, goExit,
+					pyExit == goExit && (goExit != 0) == tc.wantFail, "")
+			})
+		}
+	}
+}
+
+// warningLines returns the [WARNING] lines of out, which is how upstream's
+// logger reports config warnings.
+func warningLines(out string) []string {
+	var lines []string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "[WARNING]") {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+// TestMutableRevWarning compares upstream's WarnMutableRev: the rule (no '.'
+// and not hex), the wording, the [WARNING] prefix and the stream.
+func TestMutableRevWarning(t *testing.T) {
+	pyBin := pythonPreCommit(t)
+
+	cases := []struct {
+		name, rev string
+		warns     bool
+	}{
+		{"branch", "main", true},
+		{"dotless tag", "v1", true},
+		{"dotted tag", "v1.2.3", false},
+		{"sha", "0123456789abcdef0123456789abcdef01234567", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			cfgPath := filepath.Join(tmp, ".pre-commit-config.yaml")
+			cfg := "repos:\n-   repo: https://github.com/pre-commit/pre-commit-hooks\n" +
+				"    rev: " + tc.rev + "\n    hooks:\n    -   id: trailing-whitespace\n"
+			if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			pyOut, pyErr, pyExit := runSplit(t, ".", pyBin, "validate-config", cfgPath)
+			goOut, goErr, goExit := runSplit(t, ".", goBinary, "validate-config", cfgPath)
+			pyW, goW := warningLines(pyOut), warningLines(goOut)
+			match := pyExit == goExit &&
+				strings.Join(pyW, "\n") == strings.Join(goW, "\n") &&
+				len(pyW) == map[bool]int{true: 1, false: 0}[tc.warns] &&
+				len(warningLines(pyErr)) == 0 && len(warningLines(goErr)) == 0
+			detail := ""
+			if !match {
+				detail = fmt.Sprintf("py stdout=%q stderr=%q; go stdout=%q stderr=%q", pyOut, pyErr, goOut, goErr)
+				t.Errorf("mutable-rev warning differs for rev %q: %s", tc.rev, detail)
+			}
+			addOutputResult("validate-config", "mutable-rev warning: "+tc.name, match, detail)
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tests: validate-manifest
 // ---------------------------------------------------------------------------
@@ -800,6 +884,67 @@ func TestValidateManifest(t *testing.T) {
 		_, goExit := runCmd(t, ".", goBinary, "validate-manifest", mPath)
 		addExitResult("validate-manifest", "valid manifest succeeds", pyExit, goExit, pyExit == goExit, "")
 	})
+}
+
+// TestValidateOutput compares validate-config / validate-manifest stdout,
+// stderr and exit code with upstream (#145): nothing on success, nothing for
+// no filenames, cfgv's "is not a file" for a missing path, and a "==> File"
+// context on stdout for an invalid file. The nested "==> At ..." contexts
+// cfgv adds under it are not ported, so only that frame is compared there.
+func TestValidateOutput(t *testing.T) {
+	pyBin := pythonPreCommit(t)
+	tmp := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(tmp, name)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	goodCfg := write(
+		"good.yaml",
+		"repos:\n- repo: local\n  hooks:\n  - id: x\n    name: x\n    entry: x\n    language: system\n",
+	)
+	badCfg := write("bad.yaml", "repos:\n- repo: local\n  hooks:\n  - id: x\n")
+	goodMan := write("goodm.yaml", "- id: x\n  name: x\n  entry: x\n  language: system\n")
+	badMan := write("badm.yaml", "- id: x\n")
+	missing := filepath.Join(tmp, "missing.yaml")
+
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		exact bool
+	}{
+		{"valid config", []string{"validate-config", goodCfg}, true},
+		{"no filenames", []string{"validate-config"}, true},
+		{"missing config", []string{"validate-config", missing}, true},
+		{"invalid config", []string{"validate-config", badCfg}, false},
+		{"valid manifest", []string{"validate-manifest", goodMan}, true},
+		{"no manifest filenames", []string{"validate-manifest"}, true},
+		{"missing manifest", []string{"validate-manifest", missing}, true},
+		{"invalid manifest", []string{"validate-manifest", badMan}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pyOut, pyErr, pyExit := runSplit(t, dir, pyBin, tc.args...)
+			goOut, goErr, goExit := runSplit(t, dir, goBinary, tc.args...)
+			match := pyExit == goExit && pyErr == goErr
+			if tc.exact {
+				match = match && pyOut == goOut
+			} else {
+				frame := "\n==> File " + tc.args[1] + "\n"
+				match = match && strings.HasPrefix(pyOut, frame) && strings.HasPrefix(goOut, frame) &&
+					strings.Contains(goOut, "\n=====> ")
+			}
+			detail := ""
+			if !match {
+				detail = fmt.Sprintf("py rc=%d stdout=%q stderr=%q; go rc=%d stdout=%q stderr=%q",
+					pyExit, pyOut, pyErr, goExit, goOut, goErr)
+				t.Errorf("%s differs: %s", tc.name, detail)
+			}
+			addOutputResult(tc.args[0], tc.name, match, detail)
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,6 +1310,52 @@ func TestRun(t *testing.T) {
 		_, goExit := runCmd(t, goRepo, goBinary, "run", "nonexistent-hook", "--all-files", "--color=never")
 		addExitResult("run", "nonexistent hook-id fails", pyExit, goExit,
 			(pyExit != 0) && (goExit != 0), "")
+	})
+
+	// Which hook `run <id>` selects, and what it says when none is selected
+	// (#129): upstream matches the id or the alias, in the stage after
+	// transform_stage, where a hook with no stages is in every stage, manual
+	// included. The miss is reported on stdout, not stderr.
+	t.Run("hook-id selection and the not-found message", func(t *testing.T) {
+		cfg := `repos:
+- repo: local
+  hooks:
+  - id: anywhere
+    name: anywhere
+    entry: nope
+    language: fail
+    alias: nick
+  - id: pushy
+    name: pushy
+    entry: nope
+    language: fail
+    stages: [pre-push]
+`
+		for _, args := range [][]string{
+			{"nosuchhook"},
+			{"nosuchhook", "--hook-stage", "pre-push"},
+			{"nosuchhook", "--hook-stage", "commit"},
+			{"pushy"},
+			{"pushy", "--hook-stage", "push"},
+			{"anywhere", "--hook-stage", "manual"},
+			{"nick"},
+		} {
+			name := strings.Join(args, " ")
+			t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+			pyOut, pyErr, pyExit := runSplit(t, initTestRepo(t, cfg, "x\n"), pyBin,
+				append([]string{"run", "--color=never"}, args...)...)
+			t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+			goOut, goErr, goExit := runSplit(t, initTestRepo(t, cfg, "x\n"), goBinary,
+				append([]string{"run", "--color=never"}, args...)...)
+
+			// Every row fails, either as a missing id or as a fail hook that
+			// ran, so a row passing on two empty outputs would be a dead probe.
+			exercised := pyExit == 1 && pyOut != ""
+			addOutputResult("run", "run "+name,
+				exercised && pyExit == goExit && pyOut == goOut && pyErr == goErr,
+				fmt.Sprintf("exercised=%v py=%d go=%d\npy stdout:\n%s\npy stderr:\n%s\ngo stdout:\n%s\ngo stderr:\n%s",
+					exercised, pyExit, goExit, pyOut, pyErr, goOut, goErr))
+		}
 	})
 
 	t.Run("files flag", func(t *testing.T) {
@@ -1798,6 +1989,7 @@ func TestRemoteRepoFirstInstall(t *testing.T) {
 		exit          int
 	}{
 		{"sha rev", "fine\n", 0},
+		{"sha rev, failing hook", "BAD\n", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pyRepo := initTestRepo(t, cfg, tc.content)
@@ -1812,6 +2004,75 @@ func TestRemoteRepoFirstInstall(t *testing.T) {
 			// The repos differ only by their temp dir, which no line names.
 			addOutputResult("run", "first install output: "+tc.name, pyOut == goOut,
 				fmt.Sprintf("py:\n%s\ngo:\n%s", pyOut, goOut))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: deprecated stage names (#136)
+// ---------------------------------------------------------------------------
+
+// TestDeprecatedStagesWarning compares upstream's three deprecated-stage
+// warnings: a hook's stages and the top-level default_stages in the config,
+// and a cloned repo whose manifest still uses the old names. The old names
+// must keep working, so the manifest's hooks run at pre-commit.
+func TestDeprecatedStagesWarning(t *testing.T) {
+	pyBin := pythonPreCommit(t)
+
+	dir := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "commit.gpgsign", "false"}} {
+		runCmd(t, dir, "git", args...)
+	}
+	manifest := "-   id: legacy\n    name: legacy\n    entry: B[A]D\n    language: pygrep\n    stages: [push, commit]\n" +
+		"-   id: legacy2\n    name: legacy2\n    entry: B[A]D\n    language: pygrep\n    stages: [commit, merge-commit]\n"
+	if err := os.WriteFile(filepath.Join(dir, ".pre-commit-hooks.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, dir, "git", "add", "-A")
+	if out, code := runCmd(t, dir, "git", "commit", "-qm", "hook"); code != 0 {
+		t.Fatalf("committing the hook repo failed:\n%s", out)
+	}
+	sha, _ := runCmd(t, dir, "git", "rev-parse", "HEAD")
+	sha = strings.TrimSpace(sha)
+
+	for _, tc := range []struct {
+		name, cfg string
+		warnings  int
+	}{
+		{
+			"hook stages",
+			fmt.Sprintf("repos:\n-   repo: %s\n    rev: %s\n    hooks:\n    -   id: legacy\n        stages: [push, pre-commit, commit]\n    -   id: legacy2\n", dir, sha),
+			2,
+		},
+		{
+			"default_stages",
+			fmt.Sprintf("default_stages: [commit, push]\nrepos:\n-   repo: %s\n    rev: %s\n    hooks:\n    -   id: legacy2\n", dir, sha),
+			2,
+		},
+		{
+			"local hook stages",
+			fmt.Sprintf("repos:\n-   repo: %s\n    rev: %s\n    hooks:\n    -   id: legacy2\n"+
+				"-   repo: local\n    hooks:\n    -   id: c\n        name: c\n        entry: B[A]D\n        language: pygrep\n        stages: [merge-commit, commit]\n", dir, sha),
+			2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pyRepo := initTestRepo(t, tc.cfg, "fine\n")
+			goRepo := initTestRepo(t, tc.cfg, "fine\n")
+			t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+			pyOut, pyExit := runCmd(t, pyRepo, pyBin, "run", "--all-files", "--color=never")
+			t.Setenv("PRE_COMMIT_HOME", t.TempDir())
+			goOut, goExit := runCmd(t, goRepo, goBinary, "run", "--all-files", "--color=never")
+
+			detail := fmt.Sprintf("py:\n%s\ngo:\n%s", pyOut, goOut)
+			// Every case clones the repo, so the repo-init warning is one of them.
+			match := pyOut == goOut && pyExit == goExit &&
+				len(warningLines(pyOut)) == tc.warnings &&
+				strings.Contains(pyOut, "Passed")
+			if !match {
+				t.Errorf("deprecated-stage warnings differ: %s", detail)
+			}
+			addOutputResult("run", "deprecated stages: "+tc.name, match, detail)
 		})
 	}
 }

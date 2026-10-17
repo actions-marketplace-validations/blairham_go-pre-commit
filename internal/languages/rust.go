@@ -8,28 +8,37 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"sync"
 )
 
 // Rust implements the Language interface for Rust hooks.
 type Rust struct{}
 
-func (r *Rust) Name() string              { return "rust" }
-func (r *Rust) EnvironmentDir() string    { return "rustenv" }
-func (r *Rust) GetDefaultVersion() string { return "default" }
+// Name is the language's name in a hook manifest.
+func (r *Rust) Name() string { return "rust" }
 
-func (r *Rust) HealthCheck(prefix, version string) error {
-	envDir := filepath.Join(prefix, r.EnvironmentDir()+"-"+version)
-	binDir := filepath.Join(envDir, "bin")
-	cmd := exec.Command(filepath.Join(binDir, "cargo"), "--version")
-	if err := cmd.Run(); err != nil {
-		// Fall back to system cargo.
-		cmd = exec.Command("cargo", "--version")
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("rust environment unhealthy: %w", err)
-		}
+// EnvironmentDir is upstream's ENVIRONMENT_DIR.
+func (r *Rust) EnvironmentDir() string { return "rustenv" }
+
+// GetDefaultVersion is upstream rust.get_default_version (4.7.0), cached for
+// the process: "system" when `cargo --version` succeeds (a rustup with no
+// toolchain has a cargo that fails it), otherwise "default".
+func (r *Rust) GetDefaultVersion() string { return rustDefaultVersionOnce() }
+
+var rustDefaultVersionOnce = sync.OnceValue(rustDefaultVersion)
+
+func rustDefaultVersion() string {
+	cmd := exec.Command("cargo", "--version")
+	cmd.Dir = string(filepath.Separator)
+	if cmd.Run() == nil {
+		return "system"
 	}
-	return nil
+	return "default"
 }
+
+// HealthCheck is upstream's lang_base.basic_health_check: an installed
+// environment is always healthy. A missing toolchain shows when the hook runs.
+func (r *Rust) HealthCheck(_, _ string) error { return nil }
 
 func (r *Rust) InstallEnvironment(prefix, version string, additionalDeps []string) error {
 	envDir := filepath.Join(prefix, r.EnvironmentDir()+"-"+version)

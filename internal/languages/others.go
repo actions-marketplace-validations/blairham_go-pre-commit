@@ -14,15 +14,7 @@ import (
 // condaLang is the Conda language backend.
 var condaLang = &SimpleLanguage{
 	LangName:   "conda",
-	EnvDirName: "conda_env",
-	HealthCheckFn: func(prefix, version string) error {
-		condaExe := condaExecutable()
-		cmd := exec.Command(condaExe, "--version")
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("%s not available: %w", condaExe, err)
-		}
-		return nil
-	},
+	EnvDirName: "conda",
 	InstallFn: func(prefix, version, envDirName string, additionalDeps []string) error {
 		envDir := filepath.Join(prefix, envDirName+"-"+version)
 		condaExe := condaExecutable()
@@ -67,15 +59,7 @@ func condaExecutable() string {
 // coursierLang is the Coursier (JVM) language backend.
 var coursierLang = &SimpleLanguage{
 	LangName:   "coursier",
-	EnvDirName: "coursier_env",
-	HealthCheckFn: func(prefix, version string) error {
-		if _, err := exec.LookPath("cs"); err != nil {
-			if _, err := exec.LookPath("coursier"); err != nil {
-				return fmt.Errorf("coursier (cs) not available")
-			}
-		}
-		return nil
-	},
+	EnvDirName: "coursier",
 	InstallCmd: func(envDir, prefix string) (string, []string) {
 		csCmd := "cs"
 		if _, err := exec.LookPath(csCmd); err != nil {
@@ -89,8 +73,7 @@ var coursierLang = &SimpleLanguage{
 // dartLang is the Dart language backend.
 var dartLang = &SimpleLanguage{
 	LangName:     "dart",
-	EnvDirName:   "dart_env",
-	HealthCmd:    []string{"dart", "--version"},
+	EnvDirName:   "dartenv",
 	RunBinSubdir: "bin",
 	InstallFn: func(prefix, version, envDirName string, _ []string) error {
 		envDir := filepath.Join(prefix, envDirName+"-"+version)
@@ -115,8 +98,7 @@ var dartLang = &SimpleLanguage{
 // dotnetLang is the .NET language backend.
 var dotnetLang = &SimpleLanguage{
 	LangName:   "dotnet",
-	EnvDirName: "dotnet_env",
-	HealthCmd:  []string{"dotnet", "--version"},
+	EnvDirName: "dotnetenv",
 	InstallCmd: func(envDir, prefix string) (string, []string) {
 		return "dotnet", []string{"tool", "install", "--tool-path", envDir, "--add-source", "."}
 	},
@@ -126,7 +108,6 @@ var dotnetLang = &SimpleLanguage{
 var haskellLang = &SimpleLanguage{
 	LangName:   "haskell",
 	EnvDirName: "hs_env",
-	HealthCmd:  []string{"cabal", "--version"},
 	InstallCmd: func(envDir, prefix string) (string, []string) {
 		return "cabal", []string{"install", "--install-method=copy", "--installdir=" + envDir}
 	},
@@ -136,7 +117,6 @@ var haskellLang = &SimpleLanguage{
 var luaLang = &SimpleLanguage{
 	LangName:     "lua",
 	EnvDirName:   "lua_env",
-	HealthCmd:    []string{"luarocks", "--version"},
 	RunBinSubdir: "bin",
 	InstallCmd: func(envDir, prefix string) (string, []string) {
 		return "luarocks", []string{"install", "--tree", envDir, prefix}
@@ -147,7 +127,6 @@ var luaLang = &SimpleLanguage{
 var perlLang = &SimpleLanguage{
 	LangName:     "perl",
 	EnvDirName:   "perl_env",
-	HealthCmd:    []string{"perl", "--version"},
 	RunBinSubdir: "bin",
 	InstallCmd: func(envDir, prefix string) (string, []string) {
 		return "cpan", []string{"-T", "-l", envDir, "."}
@@ -167,7 +146,7 @@ var perlLang = &SimpleLanguage{
 // rLang is the R language backend.
 var rLang = &SimpleLanguage{
 	LangName:   "r",
-	EnvDirName: "r_env",
+	EnvDirName: "renv",
 	HealthCmd:  []string{"Rscript", "--version"},
 	InstallCmd: func(envDir, prefix string) (string, []string) {
 		script := fmt.Sprintf(
@@ -190,13 +169,9 @@ func (s *Swift) Name() string              { return "swift" }
 func (s *Swift) EnvironmentDir() string    { return "swift_env" }
 func (s *Swift) GetDefaultVersion() string { return "default" }
 
-func (s *Swift) HealthCheck(prefix, version string) error {
-	cmd := exec.Command("swift", "--version")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("swift not available: %w", err)
-	}
-	return nil
-}
+// HealthCheck is upstream's lang_base.basic_health_check: an installed
+// environment is always healthy. A missing toolchain shows when the hook runs.
+func (s *Swift) HealthCheck(_, _ string) error { return nil }
 
 func (s *Swift) InstallEnvironment(prefix, version string, additionalDeps []string) error {
 	envDir := filepath.Join(prefix, s.EnvironmentDir()+"-"+version)

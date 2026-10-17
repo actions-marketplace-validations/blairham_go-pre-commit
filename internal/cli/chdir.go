@@ -4,7 +4,9 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +32,8 @@ type rootArgs struct {
 // adjustArgsAndChdir ports upstream's main._adjust_args_and_chdir, which
 // pre-commit's main runs for every command outside COMMANDS_NO_GIT (clean,
 // gc, hazmat, init-templatedir, sample-config, validate-config and
-// validate-manifest). Paths given relative to where the user stands are made
+// validate-manifest), together with the store.mark_config_used that follows
+// it there. Paths given relative to where the user stands are made
 // absolute, the process changes to the repository root, and they are then
 // made relative to that root -- so a command run from a subdirectory finds
 // .pre-commit-config.yaml at the root, and any message that prints the
@@ -46,7 +49,8 @@ type rootArgs struct {
 // left unresolved. Through a symlinked directory that makes the two differ,
 // and upstream prints the `..`-laden result; so do we.
 //
-// The returned error is one of git's FatalError messages, for fatalError.
+// The returned error is one of git's FatalError messages, for fatalError, or
+// a failure to record the config in the store.
 func adjustArgsAndChdir(a rootArgs) error {
 	cwd, err := physicalWd()
 	if err != nil {
@@ -86,7 +90,12 @@ func adjustArgsAndChdir(a rootArgs) error {
 	if a.Repo != nil && exists(*a.Repo) {
 		*a.Repo = relpath(*a.Repo)
 	}
-	return nil
+
+	// Upstream's main follows the chdir with store.mark_config_used, which is
+	// what lets gc keep the repos every other checkout's config still uses.
+	// An unwritable store is skipped inside MarkConfigUsed; any other failure
+	// is fatal, as an exception from mark_config_used is upstream.
+	return store.New("").MarkConfigUsed(*a.Config)
 }
 
 // physicalWd is Python's os.getcwd: the working directory with symlinks
@@ -147,8 +156,30 @@ func storeDirForLog() string {
 	return dir
 }
 
+// unexpectedError reports err the way upstream's error_handler reports any
+// exception that is not a FatalError, with its exit code, 3. A failed git
+// command is upstream's CalledProcessError; anything else is named by the
+// nearest Python equivalent.
+func unexpectedError(err error) int {
+	name := "Exception"
+	var cpe *git.CalledProcessError
+	var pathErr *fs.PathError
+	switch {
+	case errors.As(err, &cpe):
+		name = "CalledProcessError"
+	case errors.As(err, &pathErr):
+		name = "OSError"
+	}
+	writeErrorLog(storeDirForLog(), "An unexpected error has occurred: "+name+": "+err.Error())
+	return 3
+}
+
 func writeFatalError(storeDir, msg string) {
-	line := "An error has occurred: FatalError: " + msg
+	writeErrorLog(storeDir, "An error has occurred: FatalError: "+msg)
+}
+
+// writeErrorLog prints line, then writes upstream's pre-commit.log for it.
+func writeErrorLog(storeDir, line string) {
 	fmt.Println(line)
 
 	gitVersion := "unknown"

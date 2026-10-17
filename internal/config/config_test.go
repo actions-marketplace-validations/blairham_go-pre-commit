@@ -4,6 +4,7 @@
 package config
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,6 +88,32 @@ func TestLoadConfig_MissingRepos(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "'repos' is required") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// Upstream's schema is cfgv.Required('repos', check_array(...)): an empty
+// list satisfies it, while a missing or null key does not.
+func TestLoadConfig_EmptyRepos(t *testing.T) {
+	for _, tc := range []struct {
+		content string
+		wantErr bool
+	}{
+		{"repos: []\n", false},
+		{"repos:\n", true},
+		{"fail_fast: true\n", true},
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("LoadConfig(%q) error = %v, want error %v", tc.content, err, tc.wantErr)
+			continue
+		}
+		if err == nil && len(cfg.Repos) != 0 {
+			t.Errorf("LoadConfig(%q) repos = %v, want none", tc.content, cfg.Repos)
+		}
 	}
 }
 
@@ -612,6 +639,20 @@ func TestSampleConfig_NonEmpty(t *testing.T) {
 	}
 }
 
+func TestTransformStage(t *testing.T) {
+	for in, want := range map[Stage]Stage{
+		"commit":       HookTypePreCommit,
+		"merge-commit": HookTypePreMergeCommit,
+		"push":         HookTypePrePush,
+		"pre-push":     HookTypePrePush,
+		"manual":       StageManual,
+	} {
+		if got := TransformStage(in); got != want {
+			t.Errorf("TransformStage(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // --- DefaultConfig tests ---
 
 func TestDefaultConfig(t *testing.T) {
@@ -636,62 +677,92 @@ func TestDefaultConfig(t *testing.T) {
 
 // --- WarnMutableRev tests ---
 
+// captureStdout runs fn with os.Stdout redirected and returns what it wrote,
+// with color forced off so the bytes are upstream's uncolored log line.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	t.Setenv("PRE_COMMIT_COLOR", "never")
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	fn()
+	w.Close()
+	data, err := io.ReadAll(r)
+	r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
 func TestWarnMutableRev(t *testing.T) {
-	// WarnMutableRev writes to stderr for mutable refs.
-	// We capture stderr to verify the warning is emitted.
-	mutableRefs := []string{"main", "master", "develop", "HEAD"}
-	for _, ref := range mutableRefs {
-		t.Run(ref, func(t *testing.T) {
-			// Redirect stderr.
-			oldStderr := os.Stderr
-			r, w, err := os.Pipe()
-			if err != nil {
-				t.Fatal(err)
+	const repo = "https://github.com/example/repo"
+	want := "[WARNING] The 'rev' field of repo 'https://github.com/example/repo' " +
+		"appears to be a mutable reference (moving tag / branch).  Mutable " +
+		"references are never updated after first install and are not " +
+		"supported.  See https://pre-commit.com/#using-the-latest-version-for-a-repository " +
+		"for more details.  Hint: `pre-commit autoupdate` often fixes this.\n"
+
+	// Upstream's rule: warn when there is no '.' and the rev is not all hex.
+	cases := []struct {
+		rev  string
+		warn bool
+	}{
+		{"main", true},
+		{"master", true},
+		{"HEAD", true},
+		{"stable", true},
+		{"v1", true},
+		{"v1.2.3", false},
+		{"1.0", false},
+		{"release.candidate", false},
+		{"deadbeef", false},
+		{"DEADBEEF", false},
+		{"0123456789abcdef0123456789abcdef01234567", false},
+		{"cafe-1", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.rev, func(t *testing.T) {
+			got := captureStdout(t, func() { WarnMutableRev(repo, tc.rev) })
+			if tc.warn && got != want {
+				t.Errorf("rev %q:\n got: %q\nwant: %q", tc.rev, got, want)
 			}
-			os.Stderr = w
-
-			WarnMutableRev("https://github.com/example/repo", ref)
-
-			w.Close()
-			os.Stderr = oldStderr
-
-			buf := make([]byte, 4096)
-			n, _ := r.Read(buf)
-			r.Close()
-			output := string(buf[:n])
-
-			if !strings.Contains(output, "WARNING") {
-				t.Errorf("expected WARNING in output for ref %q, got: %q", ref, output)
-			}
-			if !strings.Contains(output, "mutable reference") {
-				t.Errorf("expected 'mutable reference' in output for ref %q, got: %q", ref, output)
+			if !tc.warn && got != "" {
+				t.Errorf("rev %q: expected no warning, got %q", tc.rev, got)
 			}
 		})
 	}
+}
 
-	// Non-mutable refs should produce no warning.
-	t.Run("pinned_ref_no_warning", func(t *testing.T) {
-		oldStderr := os.Stderr
-		r, w, err := os.Pipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		os.Stderr = w
+func TestWarnMutableRevQuotesRepoLikePython(t *testing.T) {
+	got := captureStdout(t, func() { WarnMutableRev("/tmp/it's", "v1") })
+	if !strings.Contains(got, `repo "/tmp/it's" appears`) {
+		t.Errorf("repo not rendered as Python repr: %q", got)
+	}
+}
 
-		WarnMutableRev("https://github.com/example/repo", "v1.2.3")
-
-		w.Close()
-		os.Stderr = oldStderr
-
-		buf := make([]byte, 4096)
-		n, _ := r.Read(buf)
-		r.Close()
-		output := string(buf[:n])
-
-		if len(output) > 0 {
-			t.Errorf("expected no output for pinned ref, got: %q", output)
-		}
-	})
+func TestLoadConfigWarnsMutableRevForPathRepo(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".pre-commit-config.yaml")
+	cfg := "repos:\n" +
+		"-   repo: /some/path\n    rev: v1\n    hooks:\n    -   id: a\n" +
+		"-   repo: local\n    hooks:\n    -   id: b\n        name: b\n        entry: b\n        language: system\n" +
+		"-   repo: https://example.com/r\n    rev: v1.0.0\n    hooks:\n    -   id: c\n"
+	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	got := captureStdout(t, func() { _, err = LoadConfig(path) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(got, "[WARNING]"); n != 1 || !strings.Contains(got, "'/some/path'") {
+		t.Errorf("want exactly one warning, for /some/path; got %q", got)
+	}
 }
 
 // --- AllStages / AllHookTypes tests ---
@@ -851,5 +922,145 @@ func TestValidate_MissingHookID(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "'id' is required") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// --- Deprecated stage-name warnings ---
+
+func writeTemp(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadConfigWarnsDeprecatedStages(t *testing.T) {
+	path := writeTemp(t, ".pre-commit-config.yaml", "default_stages: [commit, push]\n"+
+		"repos:\n"+
+		"-   repo: https://example.com/r\n    rev: v1\n    hooks:\n"+
+		"    -   id: a\n        stages: [push, pre-commit, commit, push]\n"+
+		"    -   id: b\n        stages: [pre-push]\n"+
+		"-   repo: local\n    hooks:\n"+
+		"    -   id: c\n        name: c\n        entry: c\n        language: system\n        stages: [merge-commit]\n")
+	var cfg *Config
+	var err error
+	got := captureStdout(t, func() { cfg, err = LoadConfig(path) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	const tail = " which will be removed in a future version.  " +
+		"run: `pre-commit migrate-config` to automatically fix this.\n"
+	// Upstream's order: each repo's hooks, then its rev, then default_stages.
+	want := "[WARNING] hook id `a` uses deprecated stage names (push, commit, push)" + tail +
+		"[WARNING] The 'rev' field of repo 'https://example.com/r' appears to be a mutable reference " +
+		"(moving tag / branch).  Mutable references are never updated after first install and are not " +
+		"supported.  See https://pre-commit.com/#using-the-latest-version-for-a-repository for more " +
+		"details.  Hint: `pre-commit autoupdate` often fixes this.\n" +
+		"[WARNING] hook id `c` uses deprecated stage names (merge-commit)" + tail +
+		"[WARNING] top-level `default_stages` uses deprecated stage names (commit, push)" + tail
+	if got != want {
+		t.Errorf("warnings:\n got: %q\nwant: %q", got, want)
+	}
+
+	// The old names still work: they are migrated after warning.
+	if s := cfg.DefaultStages; len(s) != 2 || s[0] != HookTypePreCommit || s[1] != HookTypePrePush {
+		t.Errorf("default_stages not migrated: %v", s)
+	}
+	if s := cfg.Repos[1].Hooks[0].Stages; len(s) != 1 || s[0] != HookTypePreMergeCommit {
+		t.Errorf("hook stages not migrated: %v", s)
+	}
+}
+
+func TestLoadConfigNoDeprecatedStagesNoWarning(t *testing.T) {
+	path := writeTemp(t, ".pre-commit-config.yaml", "default_stages: [pre-commit]\n"+
+		"repos:\n-   repo: https://example.com/r\n    rev: v1.0.0\n    hooks:\n"+
+		"    -   id: a\n        stages: [pre-push, manual]\n")
+	var err error
+	got := captureStdout(t, func() { _, err = LoadConfig(path) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Errorf("expected no warnings, got %q", got)
+	}
+}
+
+func TestLoadManifestMigratesLegacyStages(t *testing.T) {
+	path := writeTemp(t, ManifestFile,
+		"- id: a\n  name: a\n  entry: a\n  language: system\n  stages: [commit, merge-commit, push, manual]\n")
+	hooks, err := LoadManifest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Stage{HookTypePreCommit, HookTypePreMergeCommit, HookTypePrePush, "manual"}
+	if got := hooks[0].Stages; len(got) != len(want) {
+		t.Fatalf("stages = %v, want %v", got, want)
+	} else {
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("stages = %v, want %v", got, want)
+			}
+		}
+	}
+}
+
+func TestWarnForStagesOnRepoInit(t *testing.T) {
+	cases := []struct {
+		name, manifest, repo, want string
+	}{
+		{
+			name:     "deduplicated in first-seen order",
+			manifest: "- id: a\n  stages: [push, commit]\n- id: b\n  stages: [commit, pre-commit, merge-commit]\n- id: c\n",
+			repo:     "https://example.com/r",
+			want: "[WARNING] repo `https://example.com/r` uses deprecated stage names " +
+				"(push, commit, merge-commit) which will be removed in a future version.  " +
+				"Hint: often `pre-commit autoupdate --repo https://example.com/r` will fix this.  " +
+				"if it does not -- consider reporting an issue to that repo.\n",
+		},
+		{
+			name:     "repo shell-quoted in the hint",
+			manifest: "- id: a\n  stages: [commit]\n",
+			repo:     "/tmp/my repo",
+			want: "[WARNING] repo `/tmp/my repo` uses deprecated stage names " +
+				"(commit) which will be removed in a future version.  " +
+				"Hint: often `pre-commit autoupdate --repo '/tmp/my repo'` will fix this.  " +
+				"if it does not -- consider reporting an issue to that repo.\n",
+		},
+		{name: "current names", manifest: "- id: a\n  stages: [pre-commit, pre-push]\n", repo: "r"},
+		{name: "no manifest", repo: "r"},
+		{name: "invalid manifest", manifest: "- id: a\n  stages: commit\n", repo: "r"},
+		{name: "hook without id", manifest: "- stages: [commit]\n", repo: "r"},
+		{name: "not a list", manifest: "id: a\n", repo: "r"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.manifest != "" {
+				if err := os.WriteFile(filepath.Join(dir, ManifestFile), []byte(tc.manifest), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := captureStdout(t, func() { WarnForStagesOnRepoInit(tc.repo, dir) })
+			if got != tc.want {
+				t.Errorf("\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestShlexQuote(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                          "''",
+		"https://example.com/r.git": "https://example.com/r.git",
+		"a@b%c+d=e:f,g.h/i-j_k":     "a@b%c+d=e:f,g.h/i-j_k",
+		"my repo":                   "'my repo'",
+		"it's":                      `'it'"'"'s'`,
+		"$HOME":                     "'$HOME'",
+	} {
+		if got := shlexQuote(in); got != want {
+			t.Errorf("shlexQuote(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

@@ -129,22 +129,30 @@ func (r *Resolver) setLocalPrefix(h *hook.Hook) error {
 	return nil
 }
 
-// checkAdditionalDependencies mirrors Python pre-commit: declaring
-// additional_dependencies for a language that installs no environment is a
-// config error, not something to drop on the floor.
+// checkAdditionalDependencies is the check upstream's repository._hook makes
+// once the hook's version is resolved: a language that installs no
+// environment can take neither a `language_version` nor
+// additional_dependencies, and declaring either is a config error rather
+// than something to drop on the floor. The wording is upstream's.
 func checkAdditionalDependencies(h *hook.Hook) error {
-	if len(h.AdditionalDependencies) == 0 {
-		return nil
-	}
 	lang, err := languages.Get(h.Language)
 	if err != nil || lang.EnvironmentDir() != "" {
 		return nil
 	}
-	return fmt.Errorf(
-		"the hook `%s` specifies `additional_dependencies` but is using language `%s` "+
-			"which does not install an environment. "+
+	field := ""
+	switch {
+	case h.LanguageVersion != "default" && h.LanguageVersion != "":
+		field = "language_version"
+	case len(h.AdditionalDependencies) > 0:
+		field = "additional_dependencies"
+	default:
+		return nil
+	}
+	return fmt.Errorf( //nolint:staticcheck // upstream's wording, capital and all
+		"The hook `%s` specifies `%s` but is using language `%s` "+
+			"which does not install an environment.  "+
 			"Perhaps you meant to use a specific language?",
-		h.ID, h.Language,
+		h.ID, field, h.Language,
 	)
 }
 
@@ -237,6 +245,19 @@ func (r *Resolver) resolveRemoteRepo(ctx context.Context, repo *config.RepoConfi
 		h.RepoDir = repoDir
 		if err := checkAdditionalDependencies(h); err != nil {
 			return nil, err
+		}
+		// Upstream's _cloned_repository_hooks gives each hook the prefix
+		// store.clone(repo, rev, additional_dependencies): a hook with
+		// dependencies of its own gets a clone of its own to build its
+		// environment in. Sharing repoDir instead puts two dependency sets
+		// in one environment directory, where each install overwrites the
+		// other's state and the next run reinstalls both.
+		if len(h.AdditionalDependencies) > 0 {
+			depsDir, err := r.Store.CloneWithDeps(repo.Repo, repo.Rev, h.AdditionalDependencies)
+			if err != nil {
+				return nil, fmt.Errorf("cloning %s@%s: %w", repo.Repo, repo.Rev, err)
+			}
+			h.RepoDir = depsDir
 		}
 		hooks = append(hooks, h)
 	}

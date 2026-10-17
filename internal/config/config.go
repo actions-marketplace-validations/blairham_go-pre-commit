@@ -7,10 +7,12 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/blairham/go-pre-commit/v4/internal/output"
 	"github.com/blairham/go-pre-commit/v4/internal/pcre"
 )
 
@@ -189,17 +191,122 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 
-	// Apply defaults.
-	cfg.ApplyDefaults()
-
-	// Warn about mutable revs.
+	// Upstream's schema warnings, in the order its schema checks them: each
+	// repo's hooks, then that repo's rev, then the top-level default_stages.
+	// They read the stages as written, so they run before ApplyDefaults
+	// migrates the legacy names.
 	for _, repo := range cfg.Repos {
+		for _, hook := range repo.Hooks {
+			warnDeprecatedStages("hook id `"+hook.ID+"`", hook.Stages)
+		}
 		if !repo.IsLocal() && !repo.IsMeta() && repo.Rev != "" {
 			WarnMutableRev(repo.Repo, repo.Rev)
 		}
 	}
+	warnDeprecatedStages("top-level `default_stages`", cfg.DefaultStages)
+
+	// Apply defaults.
+	cfg.ApplyDefaults()
 
 	return &cfg, nil
+}
+
+// legacyStages maps upstream's deprecated stage names (clientlib._STAGES) to
+// the names that replaced them.
+var legacyStages = map[Stage]Stage{
+	"commit":       HookTypePreCommit,
+	"merge-commit": HookTypePreMergeCommit,
+	"push":         HookTypePrePush,
+}
+
+// warnDeprecatedStages ports upstream's DeprecatedStagesWarning and
+// DeprecatedDefaultStagesWarning; what names the hook or `default_stages`.
+func warnDeprecatedStages(what string, stages []Stage) {
+	var legacy []string
+	for _, s := range stages {
+		if _, ok := legacyStages[s]; ok {
+			legacy = append(legacy, string(s))
+		}
+	}
+	if len(legacy) == 0 {
+		return
+	}
+	output.Warn(
+		"%s uses deprecated stage names (%s) which will be removed in a "+
+			"future version.  "+
+			"run: `pre-commit migrate-config` to automatically fix this.",
+		what, strings.Join(legacy, ", "),
+	)
+}
+
+// WarnForStagesOnRepoInit ports upstream's warn_for_stages_on_repo_init,
+// called once a repo has been cloned into directory: if the repo's manifest
+// uses deprecated stage names, say so. A manifest that does not load is left
+// alone, as upstream does; the real load reports it properly.
+func WarnForStagesOnRepoInit(repo, directory string) {
+	data, err := os.ReadFile(filepath.Join(directory, ManifestFile))
+	if err != nil {
+		return
+	}
+	// Upstream's MINIMAL_MANIFEST_SCHEMA: a list of hooks, each with a
+	// string id and an optional list of string stages.
+	var hooks []map[string]any
+	if err := yaml.Unmarshal(data, &hooks); err != nil || hooks == nil {
+		return
+	}
+	var legacy []string
+	seen := map[string]bool{}
+	for _, h := range hooks {
+		if _, ok := h["id"].(string); !ok {
+			return
+		}
+		raw, ok := h["stages"]
+		if !ok {
+			continue
+		}
+		stages, ok := raw.([]any)
+		if !ok {
+			return
+		}
+		for _, v := range stages {
+			stage, ok := v.(string)
+			if !ok {
+				return
+			}
+			if _, isLegacy := legacyStages[Stage(stage)]; isLegacy && !seen[stage] {
+				seen[stage] = true
+				legacy = append(legacy, stage)
+			}
+		}
+	}
+	if len(legacy) == 0 {
+		return
+	}
+	output.Warn(
+		"repo `%s` uses deprecated stage names (%s) which will be removed in a "+
+			"future version.  "+
+			"Hint: often `pre-commit autoupdate --repo %s` will fix this.  "+
+			"if it does not -- consider reporting an issue to that repo.",
+		repo, strings.Join(legacy, ", "), shlexQuote(repo),
+	)
+}
+
+// shlexQuote is Python's shlex.quote.
+func shlexQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	safe := true
+	for _, c := range s {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && !strings.ContainsRune("_@%+=:,./-", c) {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
 // ApplyDefaults applies default_stages and default_language_version to hooks.
@@ -231,20 +338,24 @@ func migrateLegacyStages(stages []Stage) []Stage {
 	if len(stages) == 0 {
 		return stages
 	}
-	legacyMap := map[Stage]Stage{
-		"commit":       HookTypePreCommit,
-		"merge-commit": HookTypePreMergeCommit,
-		"push":         HookTypePrePush,
-	}
 	result := make([]Stage, len(stages))
 	for i, s := range stages {
-		if mapped, ok := legacyMap[s]; ok {
+		if mapped, ok := legacyStages[s]; ok {
 			result[i] = mapped
 		} else {
 			result[i] = s
 		}
 	}
 	return result
+}
+
+// TransformStage maps a legacy stage name given to --hook-stage onto its
+// current one, as upstream's clientlib.transform_stage does.
+func TransformStage(s Stage) Stage {
+	if mapped, ok := legacyStages[s]; ok {
+		return mapped
+	}
+	return s
 }
 
 // CheckMinimumVersion checks if the current version meets the minimum requirement.
@@ -302,21 +413,35 @@ func splitDot(s string) []string {
 	return parts
 }
 
-// WarnMutableRev warns if a rev looks like a branch name rather than a tag/SHA.
-func WarnMutableRev(repo, rev string) {
-	// Check for common mutable rev patterns.
-	mutablePrefixes := []string{"master", "main", "develop", "HEAD"}
-	for _, prefix := range mutablePrefixes {
-		if rev == prefix {
-			fmt.Fprintf(os.Stderr,
-				"WARNING: The 'rev' field of repo %q appears to be a mutable reference (%q).\n"+
-					"Mutable references are never updated after first install and are not "+
-					"supported. Use `pre-commit autoupdate` to update to a pinned revision.\n",
-				repo, rev,
-			)
-			return
+// isHexRev reports whether rev matches upstream's ^[a-fA-F0-9]+$.
+func isHexRev(rev string) bool {
+	if rev == "" {
+		return false
+	}
+	for _, c := range rev {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
 		}
 	}
+	return true
+}
+
+// WarnMutableRev ports upstream's clientlib.WarnMutableRev: a rev with no
+// '.' that is not all hex looks like a moving tag or branch, so it is
+// reported through the logger, which prints a [WARNING] line on stdout.
+func WarnMutableRev(repo, rev string) {
+	if strings.Contains(rev, ".") || isHexRev(rev) {
+		return
+	}
+	output.Warn(
+		"The 'rev' field of repo %s appears to be a mutable reference "+
+			"(moving tag / branch).  Mutable references are never "+
+			"updated after first install and are not supported.  "+
+			"See https://pre-commit.com/#using-the-latest-version-for-a-repository "+
+			"for more details.  "+
+			"Hint: `pre-commit autoupdate` often fixes this.",
+		output.PyRepr(repo),
+	)
 }
 
 // LoadManifest reads and parses a .pre-commit-hooks.yaml file.
@@ -329,6 +454,12 @@ func LoadManifest(path string) ([]ManifestHook, error) {
 	var hooks []ManifestHook
 	if err := yaml.Unmarshal(data, &hooks); err != nil {
 		return nil, fmt.Errorf("failed to parse manifest file %s: %w", path, err)
+	}
+
+	// Upstream's manifest schema migrates legacy stage names too, so a hook
+	// repo that still says `commit` runs at pre-commit.
+	for i := range hooks {
+		hooks[i].Stages = migrateLegacyStages(hooks[i].Stages)
 	}
 
 	for _, h := range hooks {
@@ -351,7 +482,11 @@ func LoadManifest(path string) ([]ManifestHook, error) {
 
 // Validate validates the config structure.
 func (c *Config) Validate() error {
-	if len(c.Repos) == 0 {
+	// Upstream's schema is cfgv.Required('repos', check_array(...)): only a
+	// missing key (or one that is not a list) fails; `repos: []` is a valid
+	// config with no hooks. YAML decodes `[]` to an empty, non-nil slice and a
+	// missing or null key to nil.
+	if c.Repos == nil {
 		return fmt.Errorf("'repos' is required")
 	}
 	for i, repo := range c.Repos {

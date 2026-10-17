@@ -291,6 +291,13 @@ func Warn(format string, args ...any) {
 	fmt.Printf("%s %s\n", colorize("[WARNING]", yellow), msg)
 }
 
+// LogError prints an [ERROR] line to stdout, as upstream's logger.error does
+// through its logging handler.
+func LogError(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Printf("%s %s\n", colorize("[ERROR]", red), msg)
+}
+
 // Error prints an error message.
 func Error(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
@@ -300,4 +307,36 @@ func Error(format string, args ...any) {
 // PrintSeparator prints a separator line.
 func PrintSeparator() {
 	fmt.Println(strings.Repeat("=", 79))
+}
+
+// PyRepr renders s the way Python's repr renders a str, which is how
+// upstream formats a value interpolated with !r.
+func PyRepr(s string) string {
+	quote := byte('\'')
+	if strings.Contains(s, "'") && !strings.Contains(s, "\"") {
+		quote = '"'
+	}
+	var b strings.Builder
+	b.WriteByte(quote)
+	for _, r := range s {
+		switch {
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == rune(quote):
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte(quote)
+	return b.String()
 }

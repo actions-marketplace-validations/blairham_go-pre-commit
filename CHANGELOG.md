@@ -15,6 +15,160 @@ file was introduced; the full notes are on the
 
 ### Fixed
 
+- `validate-config` and `validate-manifest` print nothing for a valid file,
+  as upstream does, instead of `Config file(s) are valid.` /
+  `Manifest file(s) are valid.`. A failure is printed to stdout in cfgv's
+  shape (`==> File <name>` then `=====> <message>`, or
+  `=====> <name> is not a file` for a missing path) rather than to stderr as
+  `<name>: <error>`, and with no filenames nothing is validated and the exit
+  is 0, as upstream's `nargs='*'` does, instead of falling back to the default
+  file. (#145)
+- `install` and `uninstall` are ported from upstream's
+  `install_uninstall.py`. The hook path comes from git's common dir after
+  changing to the root, so `install` prints
+  `pre-commit installed at .git/hooks/pre-commit` in a plain checkout (and
+  an absolute path in a linked worktree) rather than an absolute path
+  everywhere. A foreign hook moves to `.legacy` silently, and an existing
+  legacy hook is announced as upstream does (`Running in migration mode with
+  existing hooks at ...`); `-f` removes it. `uninstall` prints
+  `<type> uninstalled` and `Restored previous hooks to <path>`, says nothing
+  about a hook that is missing or not ours, and without `-t` takes the
+  config's `default_install_hook_types`, as `install` does. With
+  `core.hooksPath` set, `install` now refuses with upstream's
+  ``[ERROR] Cowardly refusing to install hooks with `core.hooksPath` set.``
+  and exit 1, rather than warning and writing into that directory; the
+  `config file ... not found` warning, which upstream does not print, is
+  gone. (#130)
+- Health checks are upstream's, and are used where upstream uses them. An
+  installed environment is reused only while its language's health check
+  passes, and a fresh one that fails it is an error ("BUG: expected
+  environment for … to be healthy immediately after install"); before, the
+  checks were never consulted. Every language upstream gives the basic check
+  (conda, coursier, dart, docker, dotnet, golang, haskell, julia, lua, perl,
+  ruby, rust, swift, …) is now always healthy, rather than failing when its
+  tool is not on PATH; node runs `node --version` inside the env; python
+  compares the versions `pyvenv.cfg` records with the env's and the base
+  interpreter's, so an upgraded host Python gets its envs rebuilt. (#140)
+- `run <hook-id>` selects and reports as upstream does. A miss prints
+  ``No hook with id `<id>` in stage `<stage>` `` on stdout, where this port
+  printed `[ERROR] No hook with id "<id>" found` on stderr. A `repo: local`
+  hook is now found by its `alias`; a hook with no `stages` is in every
+  stage, `manual` included (upstream's `default_stages` defaults to all of
+  them); and `--hook-stage` takes the legacy names `commit`, `merge-commit`
+  and `push`, as upstream's `transform_stage` does. (#129)
+- `language_version: default` is resolved where upstream resolves it, when
+  each hook is built: a version still `default` after the manifest and the
+  config's hook are merged takes the config's `default_language_version`, and
+  one still `default` after that takes the language's own default. The env
+  directory is named after the resolved version, as upstream's is
+  (`node_env-system`, `golangenv-system`, `py_env-python3.13`, …), and a
+  manifest's explicit `language_version: default` now takes the config's
+  `default_language_version` instead of ignoring it. python's default is
+  upstream's (the versioned interpreter for the Python a pip-installed
+  pre-commit would run under, then its major version), and rust's is
+  `system` when `cargo --version` succeeds. The env directories upstream
+  names differently now carry upstream's names: `golangenv`, `conda`,
+  `coursier`, `dartenv`, `dotnetenv`, `renv`. A `language_version` on a
+  language that installs no environment is refused in upstream's words, as
+  `additional_dependencies` already was. Existing environments under the old
+  names are not reused: each is reinstalled once under its new name. (#138)
+- `language: fail` lists the files it failed on, as upstream's `fail.py`
+  does: the entry, a blank line, then one file per line. It printed only the
+  entry. (#128)
+- golang and ruby choose their default version as upstream does. A
+  `language_version: default` golang hook uses the host's Go only when
+  `go` is a real install (on PATH, not a version manager's shim, not inside
+  the home directory); otherwise the install downloads the newest Go from
+  go.dev into the env's `.go` and builds with it under `GOTOOLCHAIN=local`,
+  as an explicit `language_version` also now does. A ruby hook uses the
+  host's ruby only when both `ruby` and `gem` are real installs; otherwise
+  the install unpacks upstream's vendored rbenv into the env, and an explicit
+  version is downloaded (or built) through ruby-download/ruby-build. Ruby's
+  gem build and install now pass upstream's flags (every gemspec;
+  `--no-format-executable --no-user-install --install-dir --bindir`), and
+  hooks run with `GEM_PATH` unset and `BUNDLE_IGNORE_CONFIG=1`. The Windows
+  rules of `exe_exists` (drive letters and UNC shares, `commonpath` across
+  drives, a home at a drive root) now match ntpath. (#137)
+- A config with `repos: []` is valid, as it is upstream, where `repos` is
+  `cfgv.Required` over an array: `run`, `validate-config`, `autoupdate` and
+  `install-hooks` accept it instead of failing with `'repos' is required`. A
+  missing (or null) `repos` still fails. (#131)
+- The deprecated stage names `commit`, `merge-commit` and `push` are warned
+  about as upstream does: for a hook's `stages` and for `default_stages` in
+  the config (with a `pre-commit migrate-config` hint), and once a hook repo
+  is cloned whose manifest still uses them (with a
+  `pre-commit autoupdate --repo` hint). A hook repo's manifest that uses the
+  old names now has them migrated as the config's were, so those hooks run
+  at the right stage instead of never matching. (#136)
+- The mutable-`rev` warning is upstream's. It fired only for a `rev` of
+  exactly `master`, `main`, `develop` or `HEAD`, on stderr, in this port's own
+  words; it now fires for any `rev` with no `.` that is not all hex (so `v1`
+  and `stable` warn, as do path repos), with upstream's wording, as a
+  `[WARNING]` line on stdout. (#135)
+- `gc` no longer deletes repos that another checkout's config still uses.
+  Every command upstream runs inside a repository now records its config in
+  the store, as upstream's `store.mark_config_used` does (the path
+  realpath'd, a missing config skipped, an unwritable store left alone), so
+  `gc` sees every config that uses the cache rather than only the current
+  one. `gc` also forgets tracked configs that no longer load, as upstream's
+  `_gc` does. (#133)
+- A hook repo whose hooks declare different `additional_dependencies` (such
+  as blairham/pre-commit-hooks' golang hooks and its `go-vulncheck`) no longer
+  reinstalls its environments on every run. All of a repo's hooks shared one
+  clone, so both dependency sets were installed into one environment
+  directory, concurrently, each overwriting the other's install state; the
+  next run saw a mismatch and reinstalled both, and the two `go install`s
+  sharing one module cache failed intermittently with `unknown revision`. As
+  upstream's `store.clone(repo, rev, deps)` does, each dependency set now gets
+  a clone of its own, recorded as `repo:dep1,dep2` (which `gc` keeps while a
+  config uses it). Existing caches are reinstalled once. Installs also take
+  the store's exclusive lock and re-check what still needs installing once
+  they hold it, as upstream's `install_hook_envs` does, so two commits in
+  sibling worktrees no longer build the same environment at once. (#141)
+- The golang backend builds `go install`'s environment as upstream does: the
+  caller's environment without git's variables, with GOPATH at the hook env.
+  It no longer forces `GOTOOLCHAIN=local`, and a hook runs with only PATH
+  changed rather than with GOPATH pointed at its env, so a hook that runs the
+  go tool uses the caller's module cache. The env's module cache is removed
+  after install, as upstream does. GOBIN is set to the env's `bin` rather
+  than removed, which is the directory upstream installs into, so that a go
+  shim exporting its own GOBIN (asdf's does) cannot send the binaries
+  elsewhere. (#141)
+- `language: pygrep` prints what upstream's `pygrep.py` prints, in all four
+  modes. A matching line is `file:N:line` with no space after the line
+  number and without its line ending. `--multiline` reports the first match
+  at the line it starts on, printed as that whole line plus the rest of the
+  match, and its `^`/`$` are per line (upstream compiles with `MULTILINE |
+  DOTALL`; this port had only `DOTALL`). `--negate` was inverted: it now
+  fails, naming the file, when the pattern is nowhere in a file, rather than
+  when it is found. `--ignore-case` and argparse's abbreviations of the long
+  options are accepted. (#127)
+- `autoupdate` and `try-repo` run upstream 4.7.0's git commands with git's
+  output captured, so `Cloning into ...`, `--filter is ignored` and similar
+  no longer reach the terminal. `autoupdate` fetches each repo's `HEAD` and
+  tags blobless into an empty repository, as upstream's `RevInfo.update`
+  does; it prints upstream's `[repo] updating X -> Y` and `already up to
+  date!` lines, picks the tag that looks like a version when a moving tag
+  shares its commit, takes a tag on `HEAD` under `--bleeding-edge`, refuses
+  an update that drops a hook the config uses (exit 1), and rewrites each
+  `rev:` line by position in its own quoting, keeping comments other than
+  `# frozen:`. `try-repo` follows upstream's `_repo_ref`: a local repository
+  is cloned at its `HEAD` like a remote one, and only when it has
+  uncommitted changes to tracked files is a shadow repository committed with
+  them (untracked files are no longer copied in). A git command that fails
+  is now upstream's `An unexpected error has occurred: CalledProcessError:
+  ...` with exit 3. (#134)
+- Hooks run in upstream's xargs partitions instead of one invocation. The
+  files are split into runs of at most `max(4, ceil(files / jobs))`
+  arguments, each also short enough for the platform's command-length limit
+  (ARG_MAX less the environment, clamped to 4096..131072 bytes; 30720 UTF-16
+  units on Windows, about 7 KB for a `.bat`/`.cmd`), and run on
+  `min(partitions, jobs)` workers with their output joined in partition
+  order and the exit code of largest magnitude. `jobs` is the CPU count, 2
+  under `TRAVIS`, and 1 under `PRE_COMMIT_NO_CONCURRENCY` or for a
+  `require_serial` hook; `run --jobs` still overrides it. A hook that prints
+  once per invocation now prints as often as upstream's does, and a large
+  file list no longer risks exceeding the OS argument limit. (#132)
 - Hooks receive their files in upstream's order. Upstream shuffles each
   hook's file list with a fixed-seed `random.Random` before splitting it into
   xargs batches, unless the hook is `require_serial`; this port never

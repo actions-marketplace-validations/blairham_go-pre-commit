@@ -13,8 +13,35 @@ file was introduced; the full notes are on the
 
 ## [Unreleased]
 
+### Documentation
+
+- The parity headline in the README, docs/parity.md and docs/announcement.md
+  is 554 of 554 checks: the count from the CI parity job on `main` at
+  2aa91c9, which docs/parity.md now records. It said 149. The minimum git
+  version, 2.31 (for `git ls-files --deduplicate`, as upstream), is now
+  stated in the README, docs/parity.md and AGENTS.md. (#142)
+
 ### Fixed
 
+- A config or manifest that is not valid YAML is reported in PyYAML's words,
+  as upstream's libyaml-backed loader prints them: the scanner or parser
+  context, the problem, and their `in "<unicode string>", line L, column C`
+  marks, rather than yaml.v3's one-line `yaml: line N: ...`. This covers
+  unclosed quotes and flow collections, bad indentation in block mappings and
+  sequences, tabs, `mapping values are not allowed`, simple keys missing their
+  `:`, bad escapes, anchors, aliases, tags, block scalar headers and
+  directives. Duplicate anchors, undefined aliases, a second document,
+  unhashable keys and impossible dates (`month must be in 1..12`) are now
+  errors as upstream's, where duplicate anchors and bad dates used to load.
+  (#186)
+- Config validation emits upstream's schema warnings, in its schema order:
+  "Unexpected key(s) present at root/on <repo>", the regex-not-glob and
+  slash-normalising hints for `files`/`exclude`, and (now in place, before
+  any later key fails) the deprecated-stage and mutable-rev warnings. The
+  validator sees the values PyYAML builds, so `on:`/`yes` are bools as
+  upstream reads them, and a key that is not a string makes the unknown-key
+  warning raise upstream's `TypeError` (exit 3) instead of being accepted.
+  (#187)
 - `hook-impl` runs a `.legacy` hook as upstream's `_run_legacy` does. A
   failing legacy hook now fails the commit (`retv | run`), where this port
   printed `[WARNING] Legacy hook failed: ...` and went on. A legacy hook that
@@ -24,6 +51,12 @@ file was introduced; the full notes are on the
   pre-commit script saved as the legacy hook now stops with upstream's
   `bug: pre-commit's script is installed in migration mode` message instead
   of recursing without end. (#170)
+- A key repeated in one mapping of a config or manifest loads as upstream's
+  Python dict reads it, rather than failing: the entry keeps its first
+  position and takes the last value, and keys that are equal as Python values
+  (`1`, `1.0`, `true`) are the same key. yaml.v3 refused these with "mapping
+  key already defined", which broke, among others, `autoupdate` on a config
+  whose `sha:` migration produced a second `rev:`. (#167)
 - `language: pygrep`'s `\s` matches a vertical tab, as upstream's bytes
   pattern does (`[ \t\n\r\f\v]`), and `\S` does not, inside a character
   class too. RE2's `\s`, which pcre compiled it to, leaves `\v` out. (#181)

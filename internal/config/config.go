@@ -9,9 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/blairham/go-pre-commit/v4/internal/output"
+	"github.com/blairham/go-pre-commit/v4/internal/pyyaml"
 )
 
 // Default file names.
@@ -175,23 +174,9 @@ func LoadConfig(path string) (*Config, error) {
 	// an error here is a gap in that port, reported as upstream would a
 	// validation failure.
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := pyyaml.Unmarshal(data, &cfg); err != nil {
 		return nil, invalidConfig(inFile(path, newValidationError("%s", err.Error())))
 	}
-
-	// Upstream's schema warnings, in the order its schema checks them: each
-	// repo's hooks, then that repo's rev, then the top-level default_stages.
-	// They read the stages as written, so they run before ApplyDefaults
-	// migrates the legacy names.
-	for _, repo := range cfg.Repos {
-		for _, hook := range repo.Hooks {
-			warnDeprecatedStages("hook id `"+hook.ID+"`", hook.Stages)
-		}
-		if !repo.IsLocal() && !repo.IsMeta() && repo.Rev != "" {
-			WarnMutableRev(repo.Repo, repo.Rev)
-		}
-	}
-	warnDeprecatedStages("top-level `default_stages`", cfg.DefaultStages)
 
 	// Apply defaults.
 	cfg.ApplyDefaults()
@@ -207,26 +192,6 @@ var legacyStages = map[Stage]Stage{
 	"push":         HookTypePrePush,
 }
 
-// warnDeprecatedStages ports upstream's DeprecatedStagesWarning and
-// DeprecatedDefaultStagesWarning; what names the hook or `default_stages`.
-func warnDeprecatedStages(what string, stages []Stage) {
-	var legacy []string
-	for _, s := range stages {
-		if _, ok := legacyStages[s]; ok {
-			legacy = append(legacy, string(s))
-		}
-	}
-	if len(legacy) == 0 {
-		return
-	}
-	output.Warn(
-		"%s uses deprecated stage names (%s) which will be removed in a "+
-			"future version.  "+
-			"run: `pre-commit migrate-config` to automatically fix this.",
-		what, strings.Join(legacy, ", "),
-	)
-}
-
 // WarnForStagesOnRepoInit ports upstream's warn_for_stages_on_repo_init,
 // called once a repo has been cloned into directory: if the repo's manifest
 // uses deprecated stage names, say so. A manifest that does not load is left
@@ -239,7 +204,7 @@ func WarnForStagesOnRepoInit(repo, directory string) {
 	// Upstream's MINIMAL_MANIFEST_SCHEMA: a list of hooks, each with a
 	// string id and an optional list of string stages.
 	var hooks []map[string]any
-	if err := yaml.Unmarshal(data, &hooks); err != nil || hooks == nil {
+	if err := pyyaml.Unmarshal(data, &hooks); err != nil || hooks == nil {
 		return
 	}
 	var legacy []string
@@ -443,7 +408,7 @@ func LoadManifest(path string) ([]ManifestHook, error) {
 	}
 
 	var hooks []ManifestHook
-	if err := yaml.Unmarshal(data, &hooks); err != nil {
+	if err := pyyaml.Unmarshal(data, &hooks); err != nil {
 		return nil, invalidManifest(inFile(path, newValidationError("%s", err.Error())))
 	}
 

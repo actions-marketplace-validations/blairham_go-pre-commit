@@ -269,17 +269,27 @@ func TestMigrateConfigCommand_AlreadyUpToDate(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("expected exit code 0, got %d", code)
 	}
-	if !strings.Contains(out, "already up to date") {
-		t.Errorf("expected 'already up to date' in output, got %q", out)
+	if out != "Configuration is already migrated.\n" {
+		t.Errorf("expected upstream's 'already migrated' line, got %q", out)
 	}
 }
 
 func TestMigrateConfigCommand_MissingFile(t *testing.T) {
+	// The error handler writes pre-commit.log into the store: keep it here.
+	home := t.TempDir()
+	t.Setenv("PRE_COMMIT_HOME", home)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	t.Chdir(tempRepo(t)) // migrate-config changes to the repository root
+	defer func() {
+		if _, err := os.Stat(filepath.Join(home, "pre-commit.log")); err != nil {
+			t.Errorf("the crash log did not land in PRE_COMMIT_HOME: %v", err)
+		}
+	}()
 	cmd := &MigrateConfigCommand{Meta: &Meta{}}
 	code := cmd.Run([]string{"--config", "/nonexistent/config.yaml"})
-	if code != 1 {
-		t.Fatalf("expected exit code 1, got %d", code)
+	// Upstream's open() raises FileNotFoundError, which is unexpected: 3.
+	if code != 3 {
+		t.Fatalf("expected exit code 3, got %d", code)
 	}
 }
 
@@ -387,8 +397,9 @@ func TestInitTemplateDirCommand_CustomHookType(t *testing.T) {
 func TestInitTemplateDirCommand_NoArgs(t *testing.T) {
 	cmd := &InitTemplateDirCommand{Meta: &Meta{}}
 	code := cmd.Run(nil)
-	if code != 1 {
-		t.Fatalf("expected exit code 1 for missing args, got %d", code)
+	// argparse: "the following arguments are required: directory", exit 2.
+	if code != 2 {
+		t.Fatalf("expected exit code 2 for missing args, got %d", code)
 	}
 }
 

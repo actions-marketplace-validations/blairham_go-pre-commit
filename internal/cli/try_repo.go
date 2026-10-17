@@ -4,15 +4,12 @@
 package cli
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-
-	flags "github.com/jessevdk/go-flags"
 
 	"github.com/blairham/go-pre-commit/v4/internal/config"
 	"github.com/blairham/go-pre-commit/v4/internal/fsutil"
@@ -61,16 +58,11 @@ type tryRepoFlags struct {
 // config it generated, and runs that config's hooks.
 func (c *TryRepoCommand) Run(args []string) (code int) {
 	var opts tryRepoFlags
-	remaining, err := flags.ParseArgs(&opts, expandFilesFlag(args))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+	remaining, code, ok := parseArgs("try-repo", &opts, args, expandFilesFlag(args))
+	if !ok {
+		return code
 	}
-
-	if len(remaining) < 1 || len(remaining) > 2 {
-		fmt.Fprintf(os.Stderr, "Error: expected 1 or 2 arguments (REPO [hook-id]), got %d\n", len(remaining))
-		return 1
-	}
+	var err error
 
 	// Handle deprecated flags.
 	if opts.Rev != "" && opts.Ref == "" {
@@ -129,8 +121,7 @@ func (c *TryRepoCommand) Run(args []string) (code int) {
 		}
 		manifest, loadErr := config.LoadManifest(filepath.Join(repoPath, config.ManifestFile))
 		if loadErr != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to load manifest from %s: %v\n", repo, loadErr)
-			return 1
+			return reportError(loadErr)
 		}
 		for _, m := range manifest {
 			hookCfgs = append(hookCfgs, config.HookConfig{ID: m.ID})
@@ -143,14 +134,9 @@ func (c *TryRepoCommand) Run(args []string) (code int) {
 	printTryConfig(repo, ref, hookCfgs)
 
 	resolver := repository.NewResolver(s, tryConfig)
-	hooks, err := resolver.ResolveAll(context.Background(), tryConfig)
+	hooks, err := resolver.ResolveAll(c.Meta.ctx(), tryConfig)
 	if err != nil {
-		var cpe *git.CalledProcessError
-		if errors.As(err, &cpe) {
-			return unexpectedError(cpe)
-		}
-		fmt.Fprintf(os.Stderr, "Error: failed to resolve hooks: %v\n", err)
-		return 1
+		return reportError(err)
 	}
 
 	// Determine files.
@@ -158,22 +144,19 @@ func (c *TryRepoCommand) Run(args []string) (code int) {
 	if opts.AllFiles {
 		filenames, err = git.GetAllFiles()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to get all files: %v\n", err)
-			return 1
+			return reportError(err)
 		}
 	} else if len(opts.Files) > 0 {
 		filenames = opts.Files
 	} else if opts.FromRef != "" && opts.ToRef != "" {
 		filenames, err = git.GetChangedFiles(opts.FromRef, opts.ToRef)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to get changed files: %v\n", err)
-			return 1
+			return reportError(err)
 		}
 	} else {
 		filenames, err = git.GetStagedFiles()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to get staged files: %v\n", err)
-			return 1
+			return reportError(err)
 		}
 	}
 
@@ -191,14 +174,13 @@ func (c *TryRepoCommand) Run(args []string) (code int) {
 	// Upstream's try_repo hands off to run, which installs each hook's
 	// environment first; without this every python, node or golang hook
 	// errors with its executable not found.
-	if err := hook.InstallEnvironments(context.Background(), hooks, s.ExclusiveLock); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to install environments: %v\n", err)
-		return 1
+	if err := hook.InstallEnvironments(c.Meta.ctx(), hooks, s.ExclusiveLock); err != nil {
+		return reportError(err)
 	}
 
 	root, _ := git.GetRoot()
 	runner := hook.NewRunner(runCfg, hooks, root)
-	result := runner.Run(context.Background(), hook.RunOptions{
+	result := runner.Run(c.Meta.ctx(), hook.RunOptions{
 		HookID:                     hookID,
 		HookStage:                  stage,
 		Files:                      filenames,

@@ -4,12 +4,12 @@
 package cli
 
 import (
-	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
-	flags "github.com/jessevdk/go-flags"
+	"github.com/blairham/go-pre-commit/v4/internal/output"
 )
 
 // InitTemplateDirCommand implements the "init-templatedir" command.
@@ -25,58 +25,69 @@ type initTemplateDirFlags struct {
 
 func (c *InitTemplateDirCommand) Run(args []string) int {
 	var opts initTemplateDirFlags
-	remaining, err := flags.ParseArgs(&opts, args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-
-	if len(remaining) != 1 {
-		fmt.Fprintf(os.Stderr, "Error: expected exactly 1 argument (directory), got %d\n", len(remaining))
-		return 1
+	remaining, code, ok := parseArgs("init-templatedir", &opts, args, args)
+	if !ok {
+		return code
 	}
 	templateDir := remaining[0]
 
-	typesToInstall := opts.HookTypes
-	if len(typesToInstall) == 0 {
-		typesToInstall = []string{"pre-commit"}
-	}
-	for _, ht := range typesToInstall {
-		if _, ok := hookTypes[ht]; !ok {
-			fmt.Fprintf(os.Stderr, "Error: unknown hook type: %s. Choose from: %s\n", ht, strings.Join(sortedHookTypes(), ", "))
-			return 1
-		}
+	output.SetColorModeFromString(opts.Color)
+
+	// Upstream's init_templatedir: install into the directory, overwriting
+	// any legacy hook, then say so when git would not copy from it.
+	if code := installHookScripts(opts.Config, opts.HookTypes, true, !opts.NoAllowMissing, templateDir); code != 0 {
+		return code
 	}
 
-	hooksDir := filepath.Join(templateDir, "hooks")
-	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to create hooks directory: %v\n", err)
-		return 1
+	dest := realpath(templateDir)
+	if configured, ok := gitInitTemplateDir(); !ok || realpath(expandUser(configured)) != dest {
+		output.Warn("`init.templateDir` not set to the target directory")
+		output.Warn("maybe `git config --global init.templateDir %s`?", dest)
 	}
-
-	for _, ht := range typesToInstall {
-		hookFile := filepath.Join(hooksDir, ht)
-		installID := "pre-commit-" + ht
-		content := fmt.Sprintf(hookTemplate, installID, opts.Config, ht)
-
-		if err := os.WriteFile(hookFile, []byte(content), 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to write hook: %v\n", err)
-			return 1
-		}
-
-		fmt.Printf("pre-commit installed at %s\n", hookFile)
-	}
-
-	if opts.NoAllowMissing {
-		if _, err := os.Stat(opts.Config); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr,
-				"Warning: config file %s not found.\n",
-				opts.Config,
-			)
-		}
-	}
-
 	return 0
+}
+
+// gitInitTemplateDir is `git config init.templateDir`, from the current
+// directory as upstream runs it; ok is false when git fails, as it does when
+// the key is unset.
+func gitInitTemplateDir() (string, bool) {
+	out, err := exec.Command("git", "config", "init.templateDir").Output()
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(out)), true
+}
+
+// expandUser is os.path.expanduser for "~" and "~/...": the home directory
+// from $HOME, the path unchanged otherwise.
+func expandUser(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	return home + p[1:]
+}
+
+// realpath is os.path.realpath: an absolute path with every symlink resolved,
+// where a part that does not exist is kept as written.
+func realpath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	var rest []string
+	for dir := abs; ; dir = filepath.Dir(dir) {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(append([]string{resolved}, rest...)...)
+		}
+		if parent := filepath.Dir(dir); parent == dir {
+			return abs
+		}
+		rest = append([]string{filepath.Base(dir)}, rest...)
+	}
 }
 
 func (c *InitTemplateDirCommand) Help() string {

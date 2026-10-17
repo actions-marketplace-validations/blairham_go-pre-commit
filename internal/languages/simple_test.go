@@ -99,7 +99,8 @@ func TestPygrepOutputMatchesUpstream(t *testing.T) {
 	a := write("a.txt", "xx\nBAD one\r\nok\nBAD two")
 	b := write("b.txt", "clean\n")
 	c := write("c.txt", "foo\nbar\nbaz\n")
-	files := []string{a, b, c}
+	d := write("d.txt", "x\u0663\nnum 7\ntail \t\nbar")
+	files := []string{a, b, c, d}
 
 	cases := []struct {
 		name  string
@@ -124,29 +125,41 @@ func TestPygrepOutputMatchesUpstream(t *testing.T) {
 			entry: "^ba.$",
 			args:  []string{"--multiline"},
 			code:  1,
-			want:  c + ":2:bar\n",
+			want:  c + ":2:bar\n" + d + ":4:bar\n",
 		},
 		{
 			name:  "negate names files without a match",
 			entry: "BAD",
 			args:  []string{"--negate"},
 			code:  1,
-			want:  b + "\n" + c + "\n",
+			want:  b + "\n" + c + "\n" + d + "\n",
 		},
 		{
 			name:  "multiline negate",
 			entry: "BAD",
 			args:  []string{"--multiline", "--negate"},
 			code:  1,
-			want:  b + "\n" + c + "\n",
+			want:  b + "\n" + c + "\n" + d + "\n",
 		},
 		{
 			name:  "abbreviated long options",
 			entry: "bad",
 			args:  []string{"--ign", "--neg"},
 			code:  1,
-			want:  b + "\n" + c + "\n",
+			want:  b + "\n" + c + "\n" + d + "\n",
 		},
+		// Each line is searched with its "\n" attached, as upstream iterates a
+		// file opened 'rb' (#147).
+		{
+			name: "\\s$ takes the newline", entry: `\s$`, code: 1,
+			want: a + ":1:xx\n" + a + ":2:BAD one\n" + a + ":3:ok\n" + b + ":1:clean\n" +
+				c + ":1:foo\n" + c + ":2:bar\n" + c + ":3:baz\n" +
+				d + ":1:x\u0663\n" + d + ":2:num 7\n" + d + ":3:tail \t\n",
+		},
+		{name: "[ \\t]+$ before the newline", entry: `[ \t]+$`, code: 1, want: d + ":3:tail \t\n"},
+		{name: "\\Z is the very end", entry: `r\Z`, code: 1, want: d + ":4:bar\n"},
+		{name: "\\d is ASCII", entry: `\d`, code: 1, want: d + ":2:num 7\n"},
+		{name: "escaped and bracketed $ are literal", entry: `\$|[$]`, code: 0, want: ""},
 		{name: "ignore-case", entry: "bad two", args: []string{"--ignore-case"}, code: 1, want: a + ":4:BAD two\n"},
 	}
 	for _, tc := range cases {
@@ -319,5 +332,104 @@ func TestFailOutputMatchesUpstream(t *testing.T) {
 				t.Errorf("got (%d, %q), want (1, %q)", code, out, tc.want)
 			}
 		})
+	}
+}
+
+// pygrepLineAnchors rewrites only the anchors that stand on their own.
+func TestPygrepLineAnchors(t *testing.T) {
+	for pattern, want := range map[string]string{
+		`o$`:      `o(?=\n?\z)`,
+		`a$|b$`:   `a(?=\n?\z)|b(?=\n?\z)`,
+		`r\Z`:     `r\z`,
+		`\$`:      `\$`,
+		`[$]`:     `[$]`,
+		`[]$]$`:   `[]$](?=\n?\z)`,
+		`[^]$]\Z`: `[^]$]\z`,
+		`[\]$]$`:  `[\]$](?=\n?\z)`,
+		`\\$`:     `\\(?=\n?\z)`,
+		`plain`:   `plain`,
+	} {
+		if got := pygrepLineAnchors(pattern); got != want {
+			t.Errorf("pygrepLineAnchors(%q) = %q, want %q", pattern, got, want)
+		}
+	}
+}
+
+// Upstream compiles a bytes pattern and searches bytes, so `.` and classes
+// step one byte, \w, \b and IGNORECASE know only ASCII, and \xHH or octal
+// escapes name bytes (#179). Measured against pre-commit 4.7.0.
+func TestPygrepMatchesBytes(t *testing.T) {
+	dir := t.TempDir()
+	u := filepath.Join(dir, "u.txt")
+	e := filepath.Join(dir, "e.txt")
+	if err := os.WriteFile(u, []byte("x\xd9\xa3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(e, []byte("caf\xc3\xa9 x\n\xc3\x89t\xc3\xa9\nplain\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files := []string{u, e}
+	uLine := u + ":1:x\xd9\xa3\n"
+	cases := []struct {
+		name, entry, want string
+		args              []string
+	}{
+		{name: ". is one byte", entry: `^x..$`, want: uLine},
+		{name: ". is not a character", entry: `^x.$`, want: ""},
+		{name: "counted repeat counts bytes", entry: `^.{3}$`, want: uLine},
+		{name: "\\xHH names a byte", entry: `\xd9\xa3`, want: uLine},
+		{name: "octal names a byte", entry: `\331\243`, want: uLine},
+		{
+			name:  "range of high bytes",
+			entry: `[\x80-\xff]`,
+			want:  uLine + e + ":1:caf\xc3\xa9 x\n" + e + ":2:\xc3\x89t\xc3\xa9\n",
+		},
+		{name: "\\b is ASCII", entry: `\bx`, want: uLine + e + ":1:caf\xc3\xa9 x\n"},
+		{
+			name:  "ignore-case folds only ASCII",
+			entry: "\u00c9",
+			args:  []string{"--ignore-case"},
+			want:  e + ":2:\xc3\x89t\xc3\xa9\n",
+		},
+		{name: "multiline . is one byte", entry: `x..\n`, args: []string{"--multiline"}, want: u + ":1:x\xd9\xa3\n\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, out, err := (&Pygrep{}).Run(context.Background(), "", dir, tc.entry, tc.args, files, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(out) != tc.want {
+				t.Errorf("got %q, want %q", out, tc.want)
+			}
+		})
+	}
+}
+
+// Python's bytes-pattern \s is [ \t\n\r\f\v]; RE2's class leaves out \v
+// (#181). Measured against pre-commit 4.7.0.
+func TestPygrepSpaceIncludesVerticalTab(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "v.txt")
+	if err := os.WriteFile(f, []byte("a\vb\naxb\na\xc2\xa0b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vt, x := f+":1:a\vb\n", f+":2:axb\n"
+	for _, tc := range []struct{ entry, want string }{
+		{`a\sb`, vt},
+		{`^a\Sb`, x},
+		{`^a[\s]b`, vt},
+		{`^a[\S]b`, x},
+		{`^a[^\s]b`, x},
+		{`^a[^\S]b`, vt},
+		{`^a\S\Sb`, f + ":3:a\xc2\xa0b\n"},
+	} {
+		_, out, err := (&Pygrep{}).Run(context.Background(), "", dir, tc.entry, nil, []string{f}, "default")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(out) != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.entry, out, tc.want)
+		}
 	}
 }

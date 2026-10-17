@@ -15,6 +15,65 @@ file was introduced; the full notes are on the
 
 ### Fixed
 
+- `hook-impl` runs a `.legacy` hook as upstream's `_run_legacy` does. A
+  failing legacy hook now fails the commit (`retv | run`), where this port
+  printed `[WARNING] Legacy hook failed: ...` and went on. A legacy hook that
+  is not executable is skipped. With no `--hook-dir` (git 2.54+ hooks) no
+  legacy hook runs. The legacy hook gets `PRE_COMMIT_RUNNING_LEGACY=1`, the
+  environment git gave the hook, and empty stdin outside `pre-push`. A
+  pre-commit script saved as the legacy hook now stops with upstream's
+  `bug: pre-commit's script is installed in migration mode` message instead
+  of recursing without end. (#170)
+- `language: pygrep`'s `\s` matches a vertical tab, as upstream's bytes
+  pattern does (`[ \t\n\r\f\v]`), and `\S` does not, inside a character
+  class too. RE2's `\s`, which pcre compiled it to, leaves `\v` out. (#181)
+- `language: pygrep` matches bytes, as upstream's bytes pattern does: `.`, a
+  negated class and a counted repeat step one byte at a time, so `^x.$` no
+  longer matches `x٣` while `^x..$` does; `\xHH` and octal escapes name
+  bytes (`[\x80-\xff]` finds non-ASCII text); and `--ignore-case` folds only
+  ASCII. This holds in `--multiline` mode too. (#179)
+- Argument errors are reported as upstream's argparse reports them: the
+  parser's usage block (wrapped to the terminal, or `COLUMNS`, as argparse
+  wraps it) and `pre-commit <cmd>: error: <message>` on stderr, and exit 2,
+  instead of `Error: ...` and exit 1. That covers an invalid choice (`-t`,
+  `--hook-stage`, `--color`), a missing value, a non-integer `--jobs`, a
+  missing positional or required option, `--all-files` with `--files`, an
+  unknown command, and arguments nothing consumed, which the top-level parser
+  reports as `unrecognized arguments`. Commands that take no `-c` (`clean`,
+  `gc`, `sample-config`, `validate-config`, `validate-manifest`) now reject
+  it, and `-V` prints the version. (#175)
+- `gc` decides what is in use from the configs recorded in the store only,
+  as upstream's `_gc` does, instead of also reading the current directory's
+  config, so a repo only an untracked config refers to is now removed. Like
+  upstream's parser, `gc` takes only `--color`: `-c/--config` and extra
+  arguments are refused. (#174)
+- `language: pygrep` searches each line with its newline attached, as
+  upstream does when it iterates a file opened `rb`, so a pattern that can
+  consume the newline matches where upstream's does: `\s$` and `[^a-z]` now
+  fail every newline-terminated line, and `r\Z` no longer matches `bar\n`.
+  `$` keeps Python's meaning (the end, or just before a final newline), so
+  `[ \t]+$` and `o$` are unchanged and `o$` still misses a CRLF line. (#147)
+- `gc` reports what it did as upstream does, `<n> repo(s) removed.`, instead
+  of `Garbage collection complete.`. (#154)
+- `language: rust` honors `language_version` as upstream's `rust.py` does.
+  For anything but `system`, the install gets the toolchain through rustup
+  (`default` is `stable`), downloading rustup-init into the env when there is
+  no rustup, and the hook runs with `RUSTUP_TOOLCHAIN` set. Additional
+  dependencies are split as upstream splits them: `cli:name[:version]` is
+  `cargo install`ed into the env, and any other is a library crate added to
+  the hook's Cargo.toml with `cargo add name@spec`; before, every one was
+  `cargo install`ed. (#166)
+- `init-templatedir` is ported from upstream's `init_templatedir.py`. It
+  installs through `install`'s path, so it takes the config's
+  `default_install_hook_types` when no `-t` is given and drops an existing
+  `.legacy` hook as `install -f` does. When git's `init.templateDir`
+  (`~` expanded, symlinks resolved) is not the target directory, it prints
+  upstream's two warnings on stdout:
+  ``[WARNING] `init.templateDir` not set to the target directory`` and
+  ``[WARNING] maybe `git config --global init.templateDir <dir>`?``. The
+  stderr `Warning: config file ... not found.` under
+  `--no-allow-missing-config`, which upstream does not print, is gone.
+  (#163)
 - `validate-config` and `validate-manifest` print nothing for a valid file,
   as upstream does, instead of `Config file(s) are valid.` /
   `Manifest file(s) are valid.`. A failure is printed to stdout in cfgv's
@@ -23,6 +82,34 @@ file was introduced; the full notes are on the
   `<name>: <error>`, and with no filenames nothing is validated and the exit
   is 0, as upstream's `nargs='*'` does, instead of falling back to the default
   file. (#145)
+- The hook script `install` and `init-templatedir` write is upstream's
+  `hook-tmpl`: it carries upstream's hash on its `ID:` line, and its `ARGS`
+  line is `shlex.join`ed as upstream writes it. Each tool now recognizes the
+  other's script as its own by upstream's hash rule, so Python pre-commit no
+  longer moves a hook this port installed to `.legacy` (and vice versa); a
+  script an earlier release of this port wrote still counts as ours. The one
+  intended difference is that the script runs `pre-commit` from `PATH`
+  rather than a pinned Python. `install --allow-missing-config` and
+  `init-templatedir` (unless `--no-allow-missing-config`) now write
+  `--skip-on-missing-config`, so the hook skips a repo with no config; both
+  were no-ops. `hook-impl` checks the config after the legacy hook as
+  upstream's `_validate_config` does, printing
+  `` `.pre-commit-config.yaml` config file not found. Skipping `pre-commit`. ``
+  when it skips and upstream's `No .pre-commit-config.yaml file was found`
+  guidance (exit 1) when it does not. (#164)
+- `language: r` is a port of upstream's `r.py`. An entry must be
+  `Rscript -e <expr>` or `Rscript path/to/script` (upstream's errors
+  otherwise); a hook runs as `Rscript --no-save --no-restore --no-site-file
+  --no-environ …`, a remote hook's script resolved against the hook repo and
+  a local hook's left as written, with `R_PROFILE_USER` pointing at the env's
+  `activate.R` and `RENV_PROJECT` unset. The install copies the hook repo's
+  `renv.lock` and `renv/` into the env, runs upstream's renv restore script
+  (handed the repo path as an argument, never spliced into the source),
+  records the R version and installs the additional dependencies; R runs from
+  `R_HOME` when it is set. The health check rebuilds an env whose recorded R
+  version is not the current R's, and a `repo: local` r hook now gets
+  upstream's placeholder renv project. CI installs a pinned R and runs a
+  remote and a local r hook against Python pre-commit. (#139)
 - `install` and `uninstall` are ported from upstream's
   `install_uninstall.py`. The hook path comes from git's common dir after
   changing to the root, so `install` prints
@@ -72,6 +159,20 @@ file was introduced; the full notes are on the
   language that installs no environment is refused in upstream's words, as
   `additional_dependencies` already was. Existing environments under the old
   names are not reused: each is reinstalled once under its new name. (#138)
+- `migrate-config` is a port of upstream's: it rewrites a bare list config
+  under `repos:` (indented only when it must be), and renames `sha:` to
+  `rev:`, `python_venv` to `python` and the old stage names only where
+  upstream's schema paths reach them, splicing each over its source text so
+  quotes, comments and the rest of the file are untouched. A file that is not
+  YAML is an `InvalidConfigError`, a missing one an unexpected error (exit
+  3), and an unchanged config says "Configuration is already migrated." It
+  used to substitute text anywhere in the file. `autoupdate` now runs it
+  first, as upstream does; into a pipe its "has been migrated" line follows
+  the update lines, where Python's buffered `print()` puts it. A config whose
+  `rev:` lines cannot be found is re-dumped as PyYAML dumps it (block style,
+  sequences not indented under their key, PyYAML's quoting, escaping and
+  80-column folding) rather than as yaml.v3 does, so the reformatted file is
+  upstream's byte for byte. (#160)
 - `language: fail` lists the files it failed on, as upstream's `fail.py`
   does: the entry, a blank line, then one file per line. It printed only the
   entry. (#128)
@@ -169,6 +270,27 @@ file was introduced; the full notes are on the
   `require_serial` hook; `run --jobs` still overrides it. A hook that prints
   once per invocation now prints as often as upstream's does, and a large
   file list no longer risks exceeding the OS argument limit. (#132)
+- Errors are reported through a port of upstream's `error_handler`. An
+  expected failure prints `An error has occurred: <Type>: <message>` and
+  exits 1; any other error prints `An unexpected error has occurred: ...`
+  and exits 3; Ctrl-C prints `Interrupted (^C): KeyboardInterrupt: ` and
+  exits 130 once hooks have stopped and any stash is restored; a panic is
+  an unexpected error. Each is followed by `Check the log at
+  <store>/pre-commit.log`, and the log holds the version information, the
+  error and a stack trace. These replace the `Error: ...` lines and blanket
+  exit 1. File errors read as Python's (`FileNotFoundError: [Errno 2] No
+  such file or directory: 'x'`). (#126)
+- `.pre-commit-config.yaml` and `.pre-commit-hooks.yaml` are validated by a
+  port of upstream's cfgv schemas, in upstream's key order, and failures
+  carry its `==> At ...` / `=====> ...` context, as an `InvalidConfigError`
+  or `InvalidManifestError`. Checks that were missing now apply: a
+  `language` outside upstream's list, `rev` on a `local` or `meta` repo,
+  `entry` on a meta hook, unknown stages and `default_install_hook_types`,
+  unknown `default_language_version` keys, and wrongly typed values.
+  YAML syntax errors keep the Go parser's wording. (#126)
+- `run` with `PRE_COMMIT_ALLOW_NO_CONFIG` set no longer exits 0 on a missing
+  or invalid config; upstream honors that variable only in the git hook
+  (`hook-impl`), which still does. (#126)
 - Hooks receive their files in upstream's order. Upstream shuffles each
   hook's file list with a fixed-seed `random.Random` before splitting it into
   xargs batches, unless the hook is `require_serial`; this port never

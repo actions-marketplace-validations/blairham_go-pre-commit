@@ -5,6 +5,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,8 +14,7 @@ import (
 	"slices"
 	"strings"
 
-	flags "github.com/jessevdk/go-flags"
-
+	"github.com/blairham/go-pre-commit/v4/internal/fsutil"
 	"github.com/blairham/go-pre-commit/v4/internal/git"
 	"github.com/blairham/go-pre-commit/v4/internal/output"
 )
@@ -38,15 +38,17 @@ func (c *HookImplCommand) Run(args []string) int {
 	// Invoked by git from within a commit/checkout/etc., so GIT_DIR,
 	// GIT_INDEX_FILE and GIT_WORK_TREE point at the host repo. Clear them up front
 	// so no child git process (e.g. a hook-repo clone) can inherit them and
-	// corrupt the host index/object store. See git.ScrubProcessEnv.
+	// corrupt the host index/object store. See git.ScrubProcessEnv. The
+	// legacy hook still gets the environment git gave us, as upstream's does.
+	hookEnv := os.Environ()
 	git.ScrubProcessEnv()
 
 	var opts hookImplFlags
-	remaining, err := flags.NewParser(&opts, flags.HelpFlag|flags.PassDoubleDash).ParseArgs(args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+	remaining, code, ok := parseArgs("hook-impl", &opts, args, args)
+	if !ok {
+		return code
 	}
+	var err error
 
 	output.SetColorModeFromString(opts.Color)
 
@@ -54,36 +56,30 @@ func (c *HookImplCommand) Run(args []string) int {
 		return fatalError(err)
 	}
 
-	// Check if config exists when --skip-on-missing-config is set.
-	if opts.SkipOnMissingConfig {
-		if _, err := os.Stat(opts.Config); os.IsNotExist(err) {
-			return 0
-		}
+	// Upstream's _run_legacy: refuse to recurse into a pre-commit script
+	// saved as the legacy hook, read pre-push's refs up front (both the
+	// legacy hook and the ref translation below need them), then run the
+	// executable legacy hook, if any, with what we were given on stdin.
+	if os.Getenv("PRE_COMMIT_RUNNING_LEGACY") != "" {
+		fmt.Fprintf(os.Stderr, "bug: pre-commit's script is installed in migration mode\n"+
+			"run `pre-commit install -f --hook-type %s` to fix this\n\n"+
+			"Please report this bug at https://github.com/pre-commit/pre-commit/issues\n", opts.HookType)
+		return 1
 	}
-
-	// Check PRE_COMMIT_ALLOW_NO_CONFIG.
-	if os.Getenv("PRE_COMMIT_ALLOW_NO_CONFIG") != "" {
-		if _, err := os.Stat(opts.Config); os.IsNotExist(err) {
-			return 0
-		}
-	}
-
-	// pre-push refs arrive on stdin, and both the legacy hook and the ref
-	// translation below need them, so read it once up front (upstream's
-	// _run_legacy does the same). Handing the legacy hook os.Stdin itself
-	// would let it consume the refs before we see them.
-	var stdin []byte
+	stdin := []byte{}
 	if opts.HookType == "pre-push" {
 		var err error
 		if stdin, err = readPrePushStdin(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 1
+			return reportError(err)
 		}
 	}
+	retv, err := runLegacyHook(opts.HookType, opts.HookDir, remaining, stdin, hookEnv)
+	if err != nil {
+		return unexpectedError(err)
+	}
 
-	// Run legacy hook first (e.g., .pre-commit.legacy).
-	if err := runLegacyHook(opts.HookType, opts.HookDir, remaining, stdin); err != nil {
-		output.Warn("Legacy hook failed: %v", err)
+	if exit, stop := validateHookConfig(retv, opts.Config, opts.SkipOnMissingConfig); stop {
+		return exit
 	}
 
 	// Build args for the run command based on hook type.
@@ -110,13 +106,12 @@ func (c *HookImplCommand) Run(args []string) int {
 		}
 		pushArgs, err := prePushArgs("", remaining[0], remaining[1], stdin)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 1
+			return reportError(err)
 		}
 		if pushArgs == nil {
 			// Nothing being pushed needs checking (only deletions, or
 			// commits the remote already has): upstream runs no hooks.
-			return 0
+			return retv
 		}
 		runArgs = append(runArgs, pushArgs...)
 
@@ -171,7 +166,26 @@ func (c *HookImplCommand) Run(args []string) int {
 
 	// Execute the run command directly.
 	runCmd := &RunCommand{Meta: c.Meta}
-	return runCmd.Run(runArgs)
+	return retv | runCmd.Run(runArgs)
+}
+
+// validateHookConfig is upstream's _validate_config: with no config file, a
+// hook installed with --skip-on-missing-config (or run under
+// PRE_COMMIT_ALLOW_NO_CONFIG) says it is skipping and exits with the legacy
+// hook's status; otherwise it explains how to proceed and fails.
+func validateHookConfig(retv int, cfg string, skipOnMissingConfig bool) (exit int, stop bool) {
+	if info, err := os.Stat(cfg); err == nil && info.Mode().IsRegular() {
+		return 0, false
+	}
+	if skipOnMissingConfig || os.Getenv("PRE_COMMIT_ALLOW_NO_CONFIG") != "" {
+		fmt.Printf("`%s` config file not found. Skipping `pre-commit`.\n", cfg)
+		return retv, true
+	}
+	fmt.Printf("No %s file was found\n"+
+		"- To temporarily silence this, run `PRE_COMMIT_ALLOW_NO_CONFIG=1 git ...`\n"+
+		"- To permanently silence this, install pre-commit with the --allow-missing-config option\n"+
+		"- To uninstall pre-commit run `pre-commit uninstall`\n", cfg)
+	return 1, true
 }
 
 func (c *HookImplCommand) Help() string {
@@ -296,35 +310,29 @@ func gitOutput(dir string, args ...string) (string, error) {
 	return git.CmdOutputInDir(dir, args...)
 }
 
-// runLegacyHook runs the legacy hook script if it exists.
-// stdin is what the hook itself was given on stdin when it had to be read up
-// front (pre-push); otherwise the legacy hook inherits ours.
-func runLegacyHook(hookType, hookDir string, args []string, stdin []byte) error {
-	legacyPath := filepath.Join(legacyHookDir(hookDir), hookType+".legacy")
-	if _, err := os.Stat(legacyPath); os.IsNotExist(err) {
-		return nil // No legacy hook.
+// runLegacyHook is the rest of upstream's _run_legacy: with no hook dir
+// (git 2.54+ config-based hooks) or no executable <type>.legacy in it there
+// is nothing to run; otherwise the legacy hook runs with stdin as its input,
+// env plus PRE_COMMIT_RUNNING_LEGACY=1 as its environment, and its exit
+// status becomes retv. err is a hook that could not be started at all.
+func runLegacyHook(hookType, hookDir string, args []string, stdin []byte, env []string) (retv int, err error) {
+	if hookDir == "" {
+		return 0, nil
+	}
+	legacyPath := filepath.Join(hookDir, hookType+".legacy")
+	if !fsutil.Executable(legacyPath) {
+		return 0, nil
 	}
 
 	cmd := exec.Command(legacyPath, args...)
-	cmd.Stdin = os.Stdin
-	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
+	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-// legacyHookDir resolves where a saved .legacy hook lives: the --hook-dir git
-// invoked us from when available (handles core.hooksPath and template dirs),
-// otherwise $GIT_DIR/hooks.
-func legacyHookDir(hookDir string) string {
-	if hookDir != "" {
-		return hookDir
+	cmd.Env = append(slices.Clone(env), "PRE_COMMIT_RUNNING_LEGACY=1")
+	err = cmd.Run()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), nil
 	}
-	gitDir := os.Getenv("GIT_DIR")
-	if gitDir == "" {
-		gitDir = ".git"
-	}
-	return filepath.Join(gitDir, "hooks")
+	return 0, err
 }

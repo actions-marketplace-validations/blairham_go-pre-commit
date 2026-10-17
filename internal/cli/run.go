@@ -4,12 +4,8 @@
 package cli
 
 import (
-	"context"
-	"fmt"
 	"os"
 	"strings"
-
-	flags "github.com/jessevdk/go-flags"
 
 	"github.com/blairham/go-pre-commit/v4/internal/config"
 	"github.com/blairham/go-pre-commit/v4/internal/git"
@@ -61,12 +57,11 @@ func (c *RunCommand) Run(args []string) int {
 
 	var opts runFlags
 
-	p := flags.NewParser(&opts, flags.HelpFlag|flags.PassDoubleDash)
-	remaining, err := p.ParseArgs(expandFilesFlag(args))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+	remaining, code, ok := parseArgs("run", &opts, args, expandFilesFlag(args))
+	if !ok {
+		return code
 	}
+	var err error
 
 	// Handle deprecated flags.
 	if opts.Source != "" && opts.FromRef == "" {
@@ -76,19 +71,7 @@ func (c *RunCommand) Run(args []string) int {
 		opts.ToRef = opts.Origin
 	}
 
-	// At most one positional arg (hook-id).
-	if len(remaining) > 1 {
-		fmt.Fprintf(os.Stderr, "Error: expected at most 1 argument, got %d\n", len(remaining))
-		return 1
-	}
-
 	output.SetColorModeFromString(opts.Color)
-
-	// --files and --all-files are mutually exclusive.
-	if opts.AllFiles && len(opts.Files) > 0 {
-		fmt.Fprintf(os.Stderr, "Error: --all-files and --files are mutually exclusive\n")
-		return 1
-	}
 
 	if err = adjustArgsAndChdir(rootArgs{
 		Config:            &opts.Config,
@@ -101,11 +84,7 @@ func (c *RunCommand) Run(args []string) int {
 	// Load config.
 	cfg, err := config.LoadConfig(opts.Config)
 	if err != nil {
-		if os.Getenv("PRE_COMMIT_ALLOW_NO_CONFIG") != "" {
-			return 0
-		}
-		fmt.Fprintf(os.Stderr, "Error: failed to load config: %v\n", err)
-		return 1
+		return reportError(err)
 	}
 
 	// Propagate fail_fast from CLI or config.
@@ -116,8 +95,7 @@ func (c *RunCommand) Run(args []string) int {
 	// Get repository root.
 	root, err := git.GetRoot()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to get git root: %v\n", err)
-		return 1
+		return reportError(err)
 	}
 
 	// Set PRE_COMMIT=1.
@@ -129,10 +107,9 @@ func (c *RunCommand) Run(args []string) int {
 
 	// Resolve hooks.
 	resolver := repository.NewResolver(s, cfg)
-	hooks, err := resolver.ResolveAll(context.Background(), cfg)
+	hooks, err := resolver.ResolveAll(c.Meta.ctx(), cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to resolve hooks: %v\n", err)
-		return 1
+		return reportError(err)
 	}
 
 	// Determine files.
@@ -141,22 +118,19 @@ func (c *RunCommand) Run(args []string) int {
 	if opts.AllFiles {
 		filenames, err = git.GetAllFiles()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to get all files: %v\n", err)
-			return 1
+			return reportError(err)
 		}
 	} else if len(opts.Files) > 0 {
 		filenames = opts.Files
 	} else if opts.FromRef != "" && opts.ToRef != "" {
 		filenames, err = git.GetChangedFiles(opts.FromRef, opts.ToRef)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to get changed files: %v\n", err)
-			return 1
+			return reportError(err)
 		}
 	} else {
 		filenames, err = git.GetStagedFiles()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to get staged files: %v\n", err)
-			return 1
+			return reportError(err)
 		}
 	}
 
@@ -174,32 +148,37 @@ func (c *RunCommand) Run(args []string) int {
 
 	// Determine if we need to stash.
 	needsStash := !opts.AllFiles && len(opts.Files) == 0 && opts.FromRef == "" && opts.ToRef == "" && !noStash
-	var stashMgr *staged.Manager
 	if needsStash {
 		// StashUnstaged decides whether there is anything to stash itself: it
 		// must judge against the index git handed the hook, which a plain
 		// `git diff` here would not (see git.HostIndexEnv).
-		stashMgr = staged.NewManager(root, s.Dir())
+		stashMgr := staged.NewManager(root, s.Dir())
 		stashed, err := stashMgr.StashUnstaged()
 		if err != nil {
 			output.Warn("Failed to stash unstaged changes: %v", err)
 		}
-		if !stashed {
-			stashMgr = nil
+		if stashed {
+			// Deferred, as upstream's staged_files_only context manager
+			// is, so an error or an interrupt from here on still gives the
+			// user their unstaged changes back.
+			defer func() {
+				if err := stashMgr.Restore(); err != nil {
+					output.Warn("Failed to restore unstaged changes: %v", err)
+				}
+			}()
 		}
 	}
 
 	// Install environments (unless --no-install).
 	if !opts.NoInstall {
-		if err := hook.InstallEnvironments(context.Background(), hooks, s.ExclusiveLock); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to install environments: %v\n", err)
-			return 1
+		if err := hook.InstallEnvironments(c.Meta.ctx(), hooks, s.ExclusiveLock); err != nil {
+			return reportError(err)
 		}
 	}
 
 	// Run hooks.
 	runner := hook.NewRunner(cfg, hooks, root)
-	result := runner.Run(context.Background(), hook.RunOptions{
+	result := runner.Run(c.Meta.ctx(), hook.RunOptions{
 		HookID:                     hookID,
 		HookStage:                  stage,
 		Files:                      filenames,
@@ -230,13 +209,6 @@ func (c *RunCommand) Run(args []string) int {
 	// what the hooks changed and not the user's unstaged work.
 	if opts.ShowDiffOnFail && hasFailures {
 		hook.ShowDiffOnFailure(opts.AllFiles)
-	}
-
-	// Restore stash.
-	if stashMgr != nil {
-		if err := stashMgr.Restore(); err != nil {
-			output.Warn("Failed to restore unstaged changes: %v", err)
-		}
 	}
 
 	if hasFailures {

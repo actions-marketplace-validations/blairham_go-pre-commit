@@ -41,7 +41,7 @@ concurrency:
 jobs:
   ci:
     name: CI
-    uses: blairham/.github/.github/workflows/go-ci.yml@9711060ad4860f35860bcbf90d90f103617082d2 # v0.0.1
+    uses: blairham/.github/.github/workflows/go-ci.yml@2a975269ebbb74aa0b4ec96f45773d7d68cc7bcc # v0.0.3
     with:
       # The Makefile's test target: the race detector, verbose.
       test-command: make test
@@ -50,7 +50,7 @@ jobs:
   # classified rather than waiting for all of go-ci.
   changes:
     name: Changes
-    uses: blairham/.github/.github/workflows/go-changes.yml@9711060ad4860f35860bcbf90d90f103617082d2 # v0.0.1
+    uses: blairham/.github/.github/workflows/go-changes.yml@2a975269ebbb74aa0b4ec96f45773d7d68cc7bcc # v0.0.3
 
   # Parity is this project's entire claim, so a change that breaks it fails
   # before review rather than after a merge to main.
@@ -69,7 +69,7 @@ jobs:
           go-version-file: go.mod
           check-latest: true
           cache: true
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: needs.changes.outputs.code == 'true'
         with:
           python-version: '3.13'
@@ -99,21 +99,41 @@ jobs:
       - name: Install R
         if: needs.changes.outputs.code == 'true'
         # For the r rows (#139): a remote and a `repo: local` hook, each
-        # installed and run by both tools. Posit's prebuilt R for this image,
-        # pinned by the sha256 of the .deb as downloaded on 2026-10-16, so the
-        # runner image cannot change what is graded; apt resolves only its
-        # system dependencies.
+        # installed and run by both tools. Posit's prebuilt R, pinned by the
+        # sha256 of each image's .deb, so the runner image cannot change what
+        # is graded; apt resolves only its system dependencies.
+        #
+        # The build must be the one for the image. 24.04's links
+        # libicuuc.so.74, which 26.04 does not ship, yet installs there
+        # cleanly, and every R row then fails at environment install. An image
+        # with no pinned build fails here instead, saying which one.
         env:
           R_VERSION: '4.6.1'
-          R_SHA256: 5af816371126c8e5895600de035153cd3a64b12f4beb43f291ee34bf24f8fd2d
+          # r-4.6.1_1_amd64.deb per Posit platform, as downloaded on
+          # 2026-10-16 (ubuntu-2404) and 2026-11-01 (ubuntu-2604).
+          R_SHA256_UBUNTU_2404: 5af816371126c8e5895600de035153cd3a64b12f4beb43f291ee34bf24f8fd2d
+          R_SHA256_UBUNTU_2604: 8c7090326e0fbb4e9710f9de70f88ad00f7c9e9ba8ec903f2da8d9bc412ed4f5
         run: |
+          . /etc/os-release
+          platform="ubuntu-${VERSION_ID//./}"
+          case "$platform" in
+            ubuntu-2404) sha="$R_SHA256_UBUNTU_2404" ;;
+            ubuntu-2604) sha="$R_SHA256_UBUNTU_2604" ;;
+            *)
+              echo "::error::no pinned R build for $PRETTY_NAME: add Posit's $platform .deb and its sha256" >&2
+              exit 1
+              ;;
+          esac
           deb="r-${R_VERSION}_1_amd64.deb"
-          curl -fsSL -o "$RUNNER_TEMP/$deb" "https://cdn.posit.co/r/ubuntu-2404/pkgs/$deb"
-          echo "$R_SHA256  $RUNNER_TEMP/$deb" | sha256sum -c -
+          curl -fsSL -o "$RUNNER_TEMP/$deb" "https://cdn.posit.co/r/$platform/pkgs/$deb"
+          echo "$sha  $RUNNER_TEMP/$deb" | sha256sum -c -
           sudo apt-get update -qq
           sudo apt-get install -y -qq "$RUNNER_TEMP/$deb"
           echo "/opt/R/${R_VERSION}/bin" >> "$GITHUB_PATH"
-          "/opt/R/${R_VERSION}/bin/Rscript" --version
+          # Not `Rscript --version`: the front end answers that without
+          # starting R, and it did so on 26.04 with a build that could not
+          # load. Evaluating an expression starts R.
+          "/opt/R/${R_VERSION}/bin/Rscript" --vanilla -e 'cat(R.version.string, "\n")'
       - name: Run parity tests
         if: needs.changes.outputs.code == 'true'
         # PARITY_REQUIRE turns "no Python found" and "zero checks ran" from a
@@ -124,7 +144,7 @@ jobs:
         run: go test -v -tags=integration -timeout=600s ./test/integration/
       - name: Upload parity report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: parity-report
           path: test/integration/parity_report.json
@@ -179,6 +199,7 @@ jobs:
         if: needs.changes.outputs.code == 'true'
 
       - name: Install through the action
+        id: action
         if: needs.changes.outputs.code == 'true'
         uses: ./
         with:
@@ -197,6 +218,29 @@ jobs:
           # A drop-in that answers to the name is the whole contract, so assert
           # the name resolves rather than trusting the step above to have failed.
           command -v pre-commit
+
+      - name: The cache key names this runner
+        if: needs.changes.outputs.code == 'true'
+        # A key that leaves out the image restores an environment built on
+        # another one, and every Python hook in it fails to import (#194).
+        # Each part is checked against the runner's own values, so a key the
+        # action assembled from empty variables fails here.
+        shell: bash
+        env:
+          KEY: ${{ steps.action.outputs.cache-key }}
+        run: |
+          set -euo pipefail
+          echo "cache key: $KEY"
+          for part in "-${RUNNER_OS}-${RUNNER_ARCH}-" "-${ImageOS:?}-${ImageVersion:?}-" "-py3."; do
+            case "$KEY" in
+              *"$part"*) ;;
+              *) echo "::error::the cache key does not contain '$part'" >&2; exit 1 ;;
+            esac
+          done
+          if ! [[ "$KEY" =~ -[0-9a-f]{64}$ ]]; then
+            echo "::error::the cache key does not end in the config's hash" >&2
+            exit 1
+          fi
 
       - name: A hook with no environment runs, and changes a file
         if: needs.changes.outputs.code == 'true'
@@ -287,11 +331,11 @@ jobs:
           go-version-file: go.mod
           check-latest: true
           cache: true
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         if: needs.changes.outputs.code == 'true'
         with:
           python-version: '3.13'
-      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
         if: needs.changes.outputs.code == 'true'
         with:
           ruby-version: '3.3'
